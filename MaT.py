@@ -60,7 +60,7 @@ import csv
 import shutil
 import glob
 import sqlite3
-from crontab import CronSlices
+#from crontab import CronSlices
 # for full dump of registry key
 from regipy.registry import RegistryHive
 

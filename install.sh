@@ -34,6 +34,7 @@ pip3 install --upgrade pip
 
 pip3 install \
     pandas \
+    regipy \
     requests \
     pytsk3 \
     python-magic \
@@ -45,7 +46,8 @@ pip3 install \
     mnemonic \
     tabulate \
     pycryptodome \
-    sha3
+    sha3 \
+    lxml 
 
 echo -e "${YELLOW}[*] Installation de python-registry...${NC}"
 git clone https://github.com/williballenthin/python-registry.git /tmp/python-registry
