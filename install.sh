@@ -129,3 +129,8 @@ fi
 
 
 echo -e "${GREEN}[+] Installation terminée. ${NC}"
+
+echo -e "Usage:
+
+source $VENV_PATH/bin/activate
+python3 MaT.py -f your_file.E01 -d /mnt/analysis_directory -t 6"
