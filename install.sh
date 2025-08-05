@@ -3,19 +3,32 @@
 HAYABUSA_URL="https://github.com/Yamato-Security/hayabusa/releases/download/v3.4.0/hayabusa-3.4.0-lin-x64-gnu.zip"
 ANALYZE_MFT_URL="https://github.com/rowingdude/analyzeMFT.git"
 PYTHON_REGISTRY_URL="https://github.com/williballenthin/python-registry.git"
-
+VENV_PATH="${PWD}/MaT_venv"
 
 YELLOW='\033[1;33m'
 GREEN='\033[1;32m'
 NC='\033[0m' # No Color (reset)
 
+check_distrib(){
+    # Détection de la distribution et version
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO=$ID         # "debian" ou "ubuntu"
+        version_id=$VERSION_ID  # ex: "11", "22.04"
+    else
+        echo "Ce script d'installation ne supporte que Debian 11,12 et Ubuntu." >&2
+        exit 1
+    fi
+}
 set -e
+check_distrib
 
 echo -e "${YELLOW}[*] Installation des paquets système requis...${NC}"
 sudo apt-get update
 sudo apt-get install -y \
     python3 python3-pip \
     python3-dev \
+    python3-venv \
     build-essential \
     libmagic1 \
     libssl-dev \
@@ -28,6 +41,10 @@ sudo apt-get install -y \
     libewf-dev \
     libtsk-dev \
     libyaml-dev
+
+echo -e "${YELLOW}[*] Création du Python virtual env...${NC}"
+python3 -m venv $VENV_PATH
+source $VENV_PATH/bin/activate
 
 echo -e "${YELLOW}[*] Installation des bibliothèques Python requises...${NC}"
 pip3 install --upgrade pip
@@ -46,8 +63,8 @@ pip3 install \
     mnemonic \
     tabulate \
     pycryptodome \
-    sha3 \
-    lxml 
+    safe-pysha3 \
+    lxml
 
 echo -e "${YELLOW}[*] Installation de python-registry...${NC}"
 git clone https://github.com/williballenthin/python-registry.git /tmp/python-registry
@@ -113,3 +130,7 @@ fi
 
 echo -e "${GREEN}[+] Installation terminée. ${NC}"
 
+echo -e "Usage:
+
+source $VENV_PATH/bin/activate
+python3 MaT.py -f your_file.E01 -d /mnt/analysis_directory -t 6"
