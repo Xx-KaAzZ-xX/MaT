@@ -2829,6 +2829,87 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
     ##Finally, launch crypto research
     crypto_search(computer_name, mount_path, threads_number)
 
+def find_potential_db_leaks(computer_name, mount_path):
+    print(yellow(f"[+] Looking for potential DB Leaks"))
+
+    email_pattern = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+    #phone_pattern = re.compile(r"(?:\+33|0)[1-9](?:[\s.-]?\d{2}){4}")
+    phone_pattern = re.compile(r"^(?:\+33|0)[1-9](?:[\s.\-]?\d{2}){4}$")
+    separators = [",", ";", "|", "-"]
+
+    existing_csv = glob.glob(os.path.join(result_folder, "*files_of_interest.csv"))
+    counter = 0
+    output_csv = existing_csv[0] if existing_csv else os.path.join(root_dir, "files_of_interest.csv")
+    file_exists = os.path.exists(output_csv)
+
+    with open(output_csv, "a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=["computer_name", "type", "match", "source_file"])
+        if not file_exists:
+            writer.writeheader()
+
+        for dirpath, _, filenames in os.walk(mount_path):
+            for filename in filenames:
+                if not filename.lower().endswith((".txt", ".csv")):
+                    continue
+                file_path = os.path.join(dirpath, filename)
+                try:
+                    if os.path.getsize(file_path) < 1024:
+                        continue
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        col_counter = {sep: Counter() for sep in separators}
+                        non_empty_lines = 0
+                        match_found = None
+                        sample_lines = []
+                        for i, line in enumerate(f):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            non_empty_lines += 1
+                            if non_empty_lines <= 200:
+                                for sep in separators:
+                                    col_counter[sep][len(line.split(sep))] += 1
+                            if non_empty_lines <= 1000:
+                                sample_lines.append(line)
+                            if non_empty_lines >= 1000:
+                                break
+                        if non_empty_lines < 100:
+                            continue
+
+                        sep_found = None
+                        for sep, counts in col_counter.items():
+                            if not counts:
+                                continue
+                            most_common = counts.most_common(1)[0]
+                            if most_common[0] >= 2 and most_common[1] >= 100:
+                                sep_found = sep
+                                break
+                        if not sep_found:
+                            continue
+
+                        joined_sample = "\n".join(sample_lines)
+                        email_match = email_pattern.search(joined_sample)
+                        phone_match = phone_pattern.search(joined_sample)
+                        match = None
+                        if email_match:
+                            match = email_match.group(0)
+                        elif phone_match:
+                            match = phone_match.group(0)
+
+                        if match:
+                            writer.writerow({
+                                "computer_name": computer_name,
+                                "type": "potential_db_leak",
+                                "match": match,
+                                "source_file": file_path
+                            })
+                            counter += 1
+                except Exception:
+                    continue
+
+
+    if counter > 1:
+        print(green(f"{counter} rows added to {output_csv}"))
+
 def validate_litecoin_legacy(address):
     try:
         # Vérifier si l'adresse contient uniquement des caractères valides en Base58
@@ -2852,6 +2933,8 @@ def validate_litecoin_legacy(address):
 
     except Exception:
         return False
+
+
 
 def validate_btc_address(address):
     try:
@@ -3044,7 +3127,7 @@ def crypto_search(computer_name, mount_path, threads_number):
         "UTC--", "blockchain_wallet", "keyfile", "bitcoincash.dat", "monero-wallet.dat"
     ]
     ## ici, ça passe au scan yara "crypto"
-    file_types_to_search = ["*.txt", "*.exe", "*.exe_", "*.sql", "*.ibd", "*.mdb", "*.psql", "*.pgsql" "*.bson", "*.json", "*.dat", "*.db", "*.sqlite", "*.dmp", "pagefile.sys"]
+    file_types_to_search = ["*.txt", "*.csv", "*.exe", "*.exe_", "*.sql", "*.ibd", "*.mdb", "*.psql", "*.pgsql" "*.bson", "*.json", "*.dat", "*.db", "*.sqlite", "*.dmp", "pagefile.sys"]
     csv_columns = ['computer_name', 'type', 'match', 'source_file']
     mnemo = Mnemonic("english")
     bip39_words = set(mnemo.wordlist)  # Set des 2048 mots BIP39
@@ -3425,6 +3508,7 @@ if len(sys.argv) > 1:
             get_linux_crontab(mount_path, computer_name)
             #create_volatility_profile(mount_path)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
+            find_potential_db_leaks(computer_name, mount_path)
         elif platform == "Windows":
             computer_name = get_windows_machine_name(mount_path)
             if image_path:
@@ -3444,13 +3528,16 @@ if len(sys.argv) > 1:
             get_windows_browsing_data(mount_path, computer_name)
             hayabusa_evtx(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
+            find_potential_db_leaks(computer_name, mount_path)
             #extract_windows_evtx
         else:
             print(yellow("[!] Unknown OS"))
             run_search = input("The mouting point isn't a filesystem, but do you can launch some files of interest research? It will be quite long? (yes/no): ").strip().lower()
             if run_search == "yes":
                 computer_name = "Unknown"
-                get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
+                #get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
+                find_potential_db_leaks(computer_name, mount_path)
+                
             else:
                 print("Script is going to exit.")
                 sys.exit(0)
