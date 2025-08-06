@@ -3535,7 +3535,7 @@ if len(sys.argv) > 1:
             run_search = input("The mouting point isn't a filesystem, but do you can launch some files of interest research? It will be quite long? (yes/no): ").strip().lower()
             if run_search == "yes":
                 computer_name = "Unknown"
-                #get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
+                get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
                 find_potential_db_leaks(computer_name, mount_path)
                 
             else:
