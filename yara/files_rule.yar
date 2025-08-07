@@ -10,5 +10,5 @@ rule Detect_Files_Of_Interest {
 
     condition:
         filesize < 4000MB and
-        $onion_url or $ssh_private_key or $ssh_public_key or $potential_creds
+        any of them
 }
