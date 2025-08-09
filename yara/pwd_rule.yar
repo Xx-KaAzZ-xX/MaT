@@ -7,13 +7,18 @@ rule Leak_Password_Tokens {
         $sha_hash = /\$[0-9a-z]{1,2}\$[a-zA-Z0-9.\/]{1,40}\$[a-zA-Z0-9.\/]{5,}/
 
         // URI avec auth user:pass@
-        $uri_auth = /\b[a-z]{2,10}:\/\/[^:\n]+:[^@:\n\/]+@\b/
+        //$uri_auth = /\b[a-z]{2,10}:\/\/[^:\n]+:[^@:\n\/]+@\b/
+        $uri_auth = /\b[a-z]{2,10}:\/\/[^\x00-\x20:\n]+:[^\x00-\x20@:\n\/]+@/ // en enlevant les caractères à la con
+
 
         //email suivi d'un separateur
         $potential_creds = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\s*[:\/]\s*[a-zA-Z0-9!@#$%^&*()_+=\-]{6,}\b/
 
         // password = valeur (insensitive)
-        $password_eq = /password\s*[=:]\s*["']?[^"'\n]{5,}/ nocase
+        //$password_eq = /password\s*[=:]\s*["']?[^"'\n]{5,}/ nocase --> too much false positive with 0x
+        $password_eq = /password\s*[=:]\s*["']?(?!0x[0-9A-Fa-f]+)(?![0-9]{1,20}$)[ -~]{5,64}/ nocase
+
+
 
         // password != ou == valeur entre quotes
         $password_str = /password\s+[!=]=\s*["'][^"'\n]+["']/ nocase
@@ -21,7 +26,7 @@ rule Leak_Password_Tokens {
         // token = valeur, quelques clés usuelles
         $token_eq = /(auth[_-]?token|api[_-]?key|client[_-]?secret)\s*[=:]\s*["']?[A-Za-z0-9._\-]{10,}/ nocase
 
-        // JSON ou structure password: "xxxxx"
+        // JSON ou structure password: "xxxxx" --> trop de faux positifs
         $password_json = /"password\w*"\s*[:=]\s*"[^"\n]{5,}/ nocase
 
         // clés diverses _key, _pass, _secret

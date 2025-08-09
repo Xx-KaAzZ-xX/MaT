@@ -213,7 +213,7 @@ def get_system_info(mount_path):
                 'last_event': last_event
             })
 
-        print(green(f"System information has been written to {output_file}"))
+        print(green(f"[+] System information has been written to {output_file}"))
         return computer_name
 
     except Exception as e:
@@ -225,7 +225,7 @@ def get_network_info(mount_path, computer_name):
     syslog_file = os.path.join(mount_path, "var/log/syslog")
     csv_columns = ['computer_name', 'interface', 'ip_address', 'netmask', 'gateway']
     interfaces = []
-    print(yellow("Retrieving network configuration..."))
+    print(yellow("[!] Retrieving network configuration..."))
 
     interfaces_file = os.path.join(mount_path, "etc/network/interfaces")
     interfaces_d_dir = os.path.join(mount_path, "etc/network/interfaces.d")
@@ -247,22 +247,19 @@ def get_network_info(mount_path, computer_name):
                         'computer_name': computer_name,
                         'interface': current_iface,
                         'ip_address': '',
-                        'netmask': '',
                         'gateway': ''
                     }
                 elif 'address' in line:
-                    ip = line.split()[1]
+                    ip_str = line.split()[1]
                     try:
-                        ipaddress.ip_address(ip)
-                        current_entry['ip_address'] = ip
-                    except:
+                        ip_obj = ipaddress.ip_interface(ip_str)
+                        current_entry['ip_address'] = str(ip_obj.ip)
+                        current_entry['netmask'] = f"/{ip_obj.network.prefixlen}"
+                    except ValueError:
                         continue
-                elif 'netmask' in line:
-                    current_entry['netmask'] = line.split()[1]
-                elif 'gateway' in line:
-                    current_entry['gateway'] = line.split()[1]
             if current_entry:
                 interfaces.append(current_entry)
+
 
         if os.path.isdir(interfaces_d_dir):
             for fname in os.listdir(interfaces_d_dir):
@@ -272,7 +269,7 @@ def get_network_info(mount_path, computer_name):
                         current_entry = {}
                         for line in subf:
                             line = line.strip()
-                            if line.startswith('iface'):
+                            if line.startswith("iface"):
                                 if current_entry:
                                     interfaces.append(current_entry)
                                 parts = line.split()
@@ -281,20 +278,16 @@ def get_network_info(mount_path, computer_name):
                                     'computer_name': computer_name,
                                     'interface': current_iface,
                                     'ip_address': '',
-                                    'netmask': '',
                                     'gateway': ''
                                 }
                             elif 'address' in line:
-                                ip = line.split()[1]
+                                ip_str = line.split()[1]
                                 try:
-                                    ipaddress.ip_address(ip)
-                                    current_entry['ip_address'] = ip
-                                except:
+                                    ip_obj = ipaddress.ip_interface(ip_str)
+                                    current_entry['ip_address'] = str(ip_obj.ip)
+                                    current_entry['netmask'] = f"/{ip_obj.network.prefixlen}"
+                                except ValueError:
                                     continue
-                            elif 'netmask' in line:
-                                current_entry['netmask'] = line.split()[1]
-                            elif 'gateway' in line:
-                                current_entry['gateway'] = line.split()[1]
                         if current_entry:
                             interfaces.append(current_entry)
 
@@ -416,7 +409,7 @@ def get_users_and_groups(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_users_and_groups.csv"
     users = []
     groups = []
-    print(yellow("[+] Retrieving users & groups informations"))
+    print(yellow("[!] Retrieving users & groups informations"))
     # Command to get users from /etc/passwd
     passwd_file = os.path.join(mount_path, "etc/passwd")
     group_file = os.path.join(mount_path, "etc/group")
@@ -474,7 +467,7 @@ def get_users_and_groups(mount_path, computer_name):
 
 def list_connections(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_connections.csv"
-    print(yellow("[+] Retrieving connection information..."))
+    print(yellow("[!] Retrieving connection information..."))
 
     csv_columns = ['computer_name', 'connection_date', 'user', 'src_ip','source_file']
     # Ouvrir le fichier CSV pour écrire les informations
@@ -583,19 +576,19 @@ def list_connections(mount_path, computer_name):
                         continue
 
     if counter >= 1:
-        print(yellow(f"Removing duplicates entries into {output_file}"))
+        print(yellow(f"[!] Removing duplicates entries into {output_file}"))
         df = pd.read_csv(output_file)
         df = df.drop_duplicates(subset=['computer_name', 'connection_date', 'user', 'src_ip'])
         df.to_csv(output_file, index=False)
         print(green(f"Connections have been written into {output_file}"))
     else:
-        print(yellow(f" No connections has been found, {output_file} is empty"))
+        print(yellow(f"[!] No connections has been found, {output_file} is empty"))
 
 
 def list_installed_apps(mount_path, computer_name):
     distro_file = mount_path + "/etc/os-release"
     output_file = script_path + "/" + result_folder + "/linux_installed_apps.csv"
-    print(yellow("[+] Retrieving installed apps..."))
+    print(yellow("[!] Retrieving installed apps..."))
 
     with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['computer_name', 'package_name', 'install_date', 'version']
@@ -675,7 +668,7 @@ def list_installed_apps(mount_path, computer_name):
                             writer.writerow({'computer_name' : computer_name, 'package_name': package_name, 'install_date': install_date})
                             counter += 1
                 else:
-                    print(yellow("No RPM packages found, checking yum logs."))
+                    print(yellow("[!] No RPM packages found, checking yum logs."))
 
                     # Lister les logs yum pour récupérer les infos d'installation
                     yum_log_path = os.path.join(mount_path, "var/log/yum.log*")
@@ -708,13 +701,13 @@ def list_installed_apps(mount_path, computer_name):
             if counter >= 1:
                 print(green(f"Linux installed apps informations have been written into {output_file}"))
             else:
-                print(yellow(f"{output_file} should be empty"))
+                print(yellow(f"[!] {output_file} should be empty"))
         else:
             print(red("[-] Unknown distribution"))
 
 def get_nginx_info(computer_name, mount_path):
     print(green(f"[+] Nginx webserver detected"))
-    print(yellow(f"Retrieving Nginx information..."))
+    print(yellow(f"[!]Retrieving Nginx information..."))
     nginx_dir = os.path.join(mount_path, "etc/nginx") 
 
     output_file = os.path.join(script_path, result_folder, "linux_websites.csv")
@@ -762,11 +755,89 @@ def get_nginx_info(computer_name, mount_path):
 
 
             else:
-                print(yellow(f"{website_enabled_dir} doesn't exist"))
+                print(yellow(f"[!] {website_enabled_dir} doesn't exist"))
     except Exception as e:
         print(red(f"[-] Error retrieving Nginx information: {e}"))
     
-    print(green(f"Nginx information have been written into {output_file}"))
+    print(green(f"[+] Nginx information have been written into {output_file}"))
+
+def get_apache_info(computer_name, mount_path):
+    print(green(f"[+] Apache webserver detected"))
+    print(yellow(f"[!] Retrieving Apache information..."))
+
+    apache_dirs = [
+        os.path.join(mount_path, "etc/apache2"),  # Debian/Ubuntu
+        os.path.join(mount_path, "etc/httpd")     # CentOS/RHEL
+    ]
+
+    output_file = os.path.join(script_path, result_folder, "linux_websites.csv")
+    csv_columns = ['computer_name', 'website_name', 'website_root', 'listening_port', 'webserver']
+
+    try:
+        with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
+            writer.writeheader()
+
+            for apache_dir in apache_dirs:
+                if not os.path.exists(apache_dir):
+                    continue
+
+                # Debian/Ubuntu: /etc/apache2/sites-enabled/
+                # CentOS/RHEL: /etc/httpd/conf.d/
+                possible_conf_dirs = [
+                    os.path.join(apache_dir, "sites-enabled"),
+                    os.path.join(apache_dir, "conf.d"),
+                    os.path.join(apache_dir, "vhosts.d")
+                ]
+
+                for conf_dir in possible_conf_dirs:
+                    if not os.path.exists(conf_dir):
+                        continue
+
+                    conf_files = os.listdir(conf_dir)
+                    for conf_file in conf_files:
+                        conf_path = os.path.join(conf_dir, conf_file)
+
+                        if os.path.islink(conf_path):
+                            real_path = os.readlink(conf_path)
+                            conf_path = os.path.join(mount_path, real_path.lstrip("/"))
+
+                        try:
+                            with open(conf_path, 'r', encoding='utf-8', errors='ignore') as conf:
+                                content = conf.read()
+
+                                # ServerName
+                                server_name_match = re.search(r'^\s*ServerName\s+(.+)$', content, re.MULTILINE)
+                                website_name = server_name_match.group(1).strip() if server_name_match else 'unknown'
+
+                                # DocumentRoot
+                                root_match = re.search(r'^\s*DocumentRoot\s+(.+)$', content, re.MULTILINE)
+                                website_root = root_match.group(1).strip() if root_match else 'unknown'
+
+                                # Port (Listen directive or <VirtualHost *:port>)
+                                listen_match = re.search(r'^\s*Listen\s+(\d+)', content, re.MULTILINE)
+                                if not listen_match:
+                                    vh_match = re.search(r'<VirtualHost\s+\*:(\d+)>', content)
+                                    listening_port = vh_match.group(1) if vh_match else '80'
+                                else:
+                                    listening_port = listen_match.group(1)
+
+                                writer.writerow({
+                                    'computer_name': computer_name,
+                                    'website_name': website_name,
+                                    'website_root': website_root,
+                                    'listening_port': listening_port,
+                                    'webserver': 'apache'
+                                })
+
+                        except Exception as e:
+                            print(red(f"[-] Failed to parse {conf_file}: {e}"))
+
+    except Exception as e:
+        print(red(f"[-] Error retrieving Apache information: {e}"))
+
+    print(green(f"[+] Apache information has been written into {output_file}"))
+
 
 def list_services(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_services.csv")
@@ -808,6 +879,8 @@ def list_services(mount_path, computer_name):
                     counter += 1
                     if "nginx" in service_name:
                         get_nginx_info(computer_name, mount_path)
+                    if "apache2" in service_name or "httpd" in service_name:
+                        get_apache_info(computer_name, mount_path)
 
             # Écrire dans le fichier CSV
             with open(output_file, mode='w', newline='') as csvfile:
@@ -1611,7 +1684,7 @@ def get_windows_network_info(mount_path, computer_name):
     print(yellow("[+] Retrieving network information"))
     # Initialisation des données
     network_info = []
-
+    counter = 0
     try:
         key = reg.open("ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces")
     except Registry.RegistryKeyNotFoundException:
@@ -1644,6 +1717,7 @@ def get_windows_network_info(mount_path, computer_name):
             'gateway': gateway,
             'dns_server': dns_server
         })
+        counter += 1
 
     # Écriture dans le fichier CSV
     try:
@@ -1651,7 +1725,8 @@ def get_windows_network_info(mount_path, computer_name):
             writer = csv.DictWriter(f, fieldnames=['computer_name', 'interface', 'ip_address', 'netmask', 'gateway', 'dns_server'])
             writer.writeheader()
             writer.writerows(network_info)
-        print(green(f"Network information has been written into {output_file}"))
+        if counter > 1:
+            print(green(f"[+] Network information has been written into {output_file}"))
     except Exception as e:
         print(red(f"Erreur lors de l'écriture dans le fichier CSV: {e}"))
 
@@ -1704,7 +1779,7 @@ def get_startup_services(mount_path, computer_name):
                 # If "Start" value is not found, skip the service
                 continue
     if counter >= 1:
-        print(green(f"Windows services information has been written to {output_file}"))
+        print(green(f"[+] Windows services information has been written to {output_file}"))
 
 
 def get_windows_users(mount_path, computer_name):
@@ -1759,7 +1834,7 @@ def get_windows_users(mount_path, computer_name):
                     writer.writerow(user_info)
                     counter += 1
         if counter >= 1:
-            print(green(f"Users informations have been written into {output_file}"))
+            print(green(f"[+] Users informations have been written into {output_file}"))
     except Exception as e:
         print(red(f"[-] Error : {e}"))
 
@@ -1821,7 +1896,7 @@ def get_windows_groups(mount_path, computer_name):
                     groups.append(group_info)
                     writer.writerow(group_info)
 
-        print(green(f"Groups informations have been written into {output_file}"))
+        print(green(f"[+] Groups informations have been written into {output_file}"))
     except Exception as e:
         print(red(f"Error: {e}"))
 
@@ -2428,8 +2503,8 @@ def hayabusa_evtx(mount_path, computer_name):
             output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.csv"
             json_output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.jsonl"
             print("[+] Launching Hayabusa...")
-            #command = f"{hayabusa_path} csv-timeline -C -d {mount_path}/Windows/System32/winevt/Logs/ -T -o {output_file}"
-            command = f"{hayabusa_path} json-timeline -C -N -a -w -d {mount_path}/Windows/System32/winevt/Logs/ -L -o {json_output_file}"
+            command = f"{hayabusa_path} csv-timeline -C -d {mount_path}/Windows/System32/winevt/Logs/ -T -o {output_file}"
+            #command = f"{hayabusa_path} json-timeline -C -N -a -w -d {mount_path}/Windows/System32/winevt/Logs/ -L -o {json_output_file}"
             os.system(command)
             df = pd.read_csv(output_file)
             df['Computer'] = computer_name
@@ -2632,29 +2707,60 @@ def process_chunk(chunk, computer_name, csv_queue, thread_id):
                 if yara_result:
                     for item in yara_result:
                         csv_queue.put(item)
-            ## il faut modifier ce bloc qui actuellement est pas fou pour les BDD SQLServer
-            elif "ibd" in extension or "frm" in extension:
-                db_name = Path(file_path).parent.name  # Récupère le dossier parent comme nom de la DB
-                if not result["match"]:
-                    result["match"] = []  # Initialise une liste si vide
-                elif not isinstance(result["match"], list):
-                    result["match"] = [result["match"]]  # Convertit en liste si c'est une seule valeur
-                if db_name not in result["match"]:
-                    result["match"].append(db_name)
-                #print(db_name)
-                result.update({"type": "database_mysql"})
-                csv_queue.put(result)
-            elif "fsm" in extension or "tbl" in extension:
-                db_name = Path(file_path).parent.name  # Récupère le dossier parent comme nom de la DB
-                if not result["match"]:
-                    result["match"] = []  # Initialise une liste si vide
-                elif not isinstance(result["match"], list):
-                    result["match"] = [result["match"]]  # Convertit en liste si c'est une seule valeur
-                if db_name not in result["match"]:
-                    result["match"].append(db_name)
-                result.update({"type": "database_postgresql"})
-                csv_queue.put(result)
 
+            elif "ibd" in extension or "frm" in extension:
+                parent_dir = Path(file_path).parent
+                db_name = parent_dir.name
+            
+                mysql_data_dir = None
+                for ancestor in [parent_dir, parent_dir.parent]:
+                    # On cherche un fichier mysql.sock, ibdata1 ou un fichier typique mysql (ex: mysql/user.frm)
+                    if (ancestor / "mysql.sock").exists() or (ancestor / "ibdata1").exists():
+                        mysql_data_dir = ancestor
+                        break
+                    # Ou un dossier contenant mysql (ex: /var/lib/mysql/mysql/)
+                    if (ancestor / "mysql").is_dir():
+                        mysql_data_dir = ancestor
+                        break
+            
+                if mysql_data_dir is None:
+                    # Pas de datadir MySQL trouvé dans les ancêtres proches => possible faux positif, ignorer
+                    pass
+                else:
+                    if not result["match"]:
+                        result["match"] = []
+                    elif not isinstance(result["match"], list):
+                        result["match"] = [result["match"]]
+
+                    if db_name not in result["match"]:
+                        result["match"].append(db_name)
+                    result.update({"type": "database_mysql"})
+                    csv_queue.put(result)
+
+            elif "fsm" in extension or "tbl" in extension:
+                parent_dir = Path(file_path).parent
+                db_name = parent_dir.name
+            
+                # look in directory before for pg* stuff
+                pgdata_dir = None
+                for ancestor in [parent_dir, parent_dir.parent]:
+                    if (ancestor / "PG_VERSION").exists() or any(d.name.startswith("pg") for d in ancestor.iterdir() if d.is_dir()):
+                        pgdata_dir = ancestor
+                        break
+                if pgdata_dir is None:
+                    # if nothing is found, we don't give a shit
+                    pass
+                else:
+                    if not result["match"]:
+                        result["match"] = []
+                    elif not isinstance(result["match"], list):
+                        result["match"] = [result["match"]]
+            
+                    if db_name not in result["match"]:
+                        result["match"].append(db_name)
+                    result.update({"type": "database_postgresql"})
+                    csv_queue.put(result)
+            
             elif extension in {"mdf", "ndf", "ldf"}:
                 parent_dir = Path(file_path).parent
                 mdf_files = list(parent_dir.glob("*.mdf"))
@@ -2721,7 +2827,7 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
     files_to_search = ['wallet.*', '*.wallet', "*.kdbx", '*.tox', 'docker-compose.yml', "Dockerfile"]
     file_types_to_search = ["*.txt", "*.exe", "*.exe_", "*.sql", "*.ibd", "*.mdb", "*.psql", "*.pgsql", "*.frm",
                             "*.tbl", "*.mdf", "*.ndf", "*.ldf", "*.bson", "*.json", "*.dat", "*.db", "*.sqlite",
-                            "*.dmp", "pagefile.sys", "*.sh", "*.ps1", "*.py", "*.pl"]
+                            "*.dmp", "pagefile.sys", "*.sh", "*.ps1", "*.py", "*.pl", "*.asc", "*.pgp", "*.gpg"]
 
     num_threads = threads_number
     files_found = []
@@ -2797,7 +2903,7 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
                     if file_entropy > 4.1:
                         writer.writerow({"computer_name": computer_name, "type": "potential_veracrypt_container", "match": "", "source_file": file_path})
     # Optional: Remove duplicates
-    print("[+] Removing duplicates in CSV...")
+    print("[+] Removing duplicates and false positives in CSV...")
     try:
         df = pd.read_csv(output_file)
 
@@ -2817,8 +2923,9 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
         df_unique = df_unique[~((df_unique['type'] == 'email_addr') | (df_unique['type'] == 'potential_creds') & (df_unique['source_file'].str.contains('/usr/bin/')| df_unique['source_file'].str.contains('/sbin/') ))]
         #erase all false positives from Docker dir
         df_unique = df_unique[~((df_unique['source_file'].str.contains('/docker')& df_unique['source_file'].str.contains('/sha256') ))]
-
-
+        # erase false positives from password_json
+        df_unique = df_unique[~((df_unique['type'] == 'password_json') & (df_unique['source_file'].str.contains('/Mozilla/') | (df_unique['source_file'].str.contains('/example'))))]
+        df_unique = df_unique[~((df_unique['type'] == 'json_password2') & (df_unique['source_file'].str.contains('/Mozilla/') | (df_unique['source_file'].str.contains('/example'))))]
 
 
         # export to csv
@@ -2839,7 +2946,7 @@ def find_potential_db_leaks(computer_name, mount_path):
 
     existing_csv = glob.glob(os.path.join(result_folder, "*files_of_interest.csv"))
     counter = 0
-    output_csv = existing_csv[0] if existing_csv else os.path.join(root_dir, "files_of_interest.csv")
+    output_csv = existing_csv[0] if existing_csv else os.path.join(result_folder, "files_of_interest.csv")
     file_exists = os.path.exists(output_csv)
 
     with open(output_csv, "a", newline="", encoding="utf-8") as csvfile:
@@ -3529,7 +3636,6 @@ if len(sys.argv) > 1:
             hayabusa_evtx(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
-            #extract_windows_evtx
         else:
             print(yellow("[!] Unknown OS"))
             run_search = input("The mouting point isn't a filesystem, but do you can launch some files of interest research? It will be quite long? (yes/no): ").strip().lower()

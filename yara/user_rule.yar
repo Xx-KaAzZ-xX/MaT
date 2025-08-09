@@ -31,8 +31,8 @@ rule user_rules
         // 10. hostname foo.bar.baz
         $hostname = /hostname\s+[^\n\s"'.]+\.[^\n\s"'.]+\.[^\n\s"']+/i
 
-        // 11. username
-        $username = /username\s+[^\n\s]{5,200}/i
+        // 11. username --> too much false positives
+        //$username = /username\s+[^\n\s]{5,200}/i
 
         // 14. MAILCHIMP_LIST_ID
         $mailchimp = /MAILCHIMP_LIST_ID\s*=\s*['"][^\n\s'"]{5,200}/i
