@@ -1014,7 +1014,168 @@ def get_firewall_rules(mount_path, computer_name):
     
 
 
+def get_browsing_history(mount_path, computer_name):
+    output_file = os.path.join(script_path, result_folder, "browsing_history.csv")
+    csv_columns = ['computer_name', 'source', 'user', 'url_title', 'link', 'visit_date']
+    print(yellow(f"[!] Searching browsing history in {mount_path}"))
 
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+        counter = 0
+        # Recherche recursive
+        for root, dirs, files in os.walk(mount_path):
+            # --- Firefox ---
+            if "places.sqlite" in files:
+                db_path = os.path.join(root, "places.sqlite")
+                temp_file = "/tmp/places_firefox.sqlite"
+                try:
+                    shutil.copyfile(db_path, temp_file)
+                    conn = sqlite3.connect(temp_file)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT moz_places.url, moz_places.title, moz_historyvisits.visit_date
+                        FROM moz_places, moz_historyvisits
+                        WHERE moz_places.id = moz_historyvisits.place_id
+                    """)
+                    for url, title, visit_time in cursor.fetchall():
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'source': 'Firefox',
+                            'user': root.split(os.sep)[-2] if len(root.split(os.sep)) > 1 else 'unknown',
+                            'url_title': title,
+                            'link': url,
+                            'visit_date': convert_firefox_time(visit_time)
+                        })
+                        counter += 1
+                    conn.close()
+                except Exception as e:
+                    print(f"[-] Error processing {db_path}: {e}")
+
+            # --- Chrome/Chromium ---
+            if "History" in files:
+                db_path = os.path.join(root, "History")
+                temp_file = "/tmp/history_chrome.sqlite"
+                try:
+                    shutil.copyfile(db_path, temp_file)
+                    conn = sqlite3.connect(temp_file)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT urls.url, urls.title, visits.visit_time
+                        FROM urls, visits
+                        WHERE urls.id = visits.url
+                    """)
+                    for url, title, visit_time in cursor.fetchall():
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'source': 'Chrome',
+                            'user': root.split(os.sep)[-2] if len(root.split(os.sep)) > 1 else 'unknown',
+                            'url_title': title,
+                            'link': url,
+                            'visit_date': convert_chrome_time(visit_time)
+                        })
+                        counter += 1
+                    conn.close()
+                except Exception as e:
+                    print(f"[-] Error processing {db_path}: {e}")
+    if counter > 1:
+        print(green(f"[+] Browsing history has been written to {output_file}"))
+    else:
+        print(yellow(f"[!] No Browsing history found."))
+
+
+def get_browsing_data(computer_name, mount_path):
+    output_file = os.path.join(script_path, result_folder, "browsing_data.csv")
+    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date']
+    print(yellow("[!] Retrieving browsing datas"))
+
+    counter = 0
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+        for root, dirs, files in os.walk(mount_path):
+            # heuristique utilisateur
+            parts = root.split(os.sep)
+            user = "unknown"
+            if "home" in parts:
+                idx = parts.index("home")
+                if idx + 1 < len(parts):
+                    user = parts[idx + 1]
+
+            # ---- Chrome / Chromium ----
+            if "Login Data" in files:
+                chrome_login_path = os.path.join(root, "Login Data")
+                temp_file = f"/tmp/login_chrome_{hash(chrome_login_path)}.sqlite"
+                try:
+                    shutil.copyfile(chrome_login_path, temp_file)
+                    conn = sqlite3.connect(temp_file)
+                    cursor = conn.cursor()
+
+                    try:
+                        cursor.execute("SELECT origin_url, username_value, password_value, date_created FROM logins")
+                        for url, username, password, date_created in cursor.fetchall():
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': 'Chrome',
+                                'user': user,
+                                'ident': username or '',
+                                'creds': password or '',  # chiffré
+                                'platform': url or '',
+                                'saved_date': convert_chrome_time(date_created) if date_created else ''
+                            })
+                            counter += 1
+                    except Exception as e:
+                        print(yellow(f"[~] Skipping 'logins' table in {chrome_login_path}: {e}"))
+
+                    try:
+                        cursor.execute("SELECT origin_domain, username_value, update_time FROM stats")
+                        for url, username, update_time in cursor.fetchall():
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': 'Chrome (stats)',
+                                'user': user,
+                                'ident': username or '',
+                                'creds': '',
+                                'platform': url or '',
+                                'saved_date': convert_chrome_time(update_time) if update_time else ''
+                            })
+                            counter += 1
+                    except:
+                        pass
+
+                    conn.close()
+                except Exception as e:
+                    print(red(f"[-] Error processing Chrome logins at {chrome_login_path}: {e}"))
+
+            # ---- Firefox ----
+            if "logins.json" in files:
+                firefox_login_path = os.path.join(root, "logins.json")
+                temp_file = f"/tmp/logins_firefox_{hash(firefox_login_path)}.json"
+                try:
+                    shutil.copyfile(firefox_login_path, temp_file)
+                    with open(temp_file, 'r', encoding='utf-8') as jf:
+                        data = json.load(jf)
+                        logins = data.get('logins', [])
+                        for entry in logins:
+                            ts = entry.get('timeCreated')
+                            saved = datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ''
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': 'Firefox',
+                                'user': user,
+                                'ident': entry.get('usernameField', '') or entry.get('encryptedUsername', ''),
+                                'creds': entry.get('passwordField', '') or entry.get('encryptedPassword', ''),  # chiffré
+                                'platform': entry.get('hostname', ''),
+                                'saved_date': saved
+                            })
+                            counter += 1
+                except Exception as e:
+                    print(red(f"[-] Error processing Firefox logins at {firefox_login_path}: {e}"))
+
+    if counter:
+        print(green(f"[+] Browsing data written to {output_file} ({counter} rows)"))
+    else:
+        print(yellow(f"[!] No browsing data found, {output_file} should be empty"))
 
 
 def get_linux_browsing_history(mount_path, computer_name):
@@ -2937,7 +3098,7 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
     crypto_search(computer_name, mount_path, threads_number)
 
 def find_potential_db_leaks(computer_name, mount_path):
-    print(yellow(f"[+] Looking for potential DB Leaks"))
+    print(yellow(f"[!] Looking for potential DB Leaks"))
 
     email_pattern = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
     #phone_pattern = re.compile(r"(?:\+33|0)[1-9](?:[\s.-]?\d{2}){4}")
@@ -3016,6 +3177,8 @@ def find_potential_db_leaks(computer_name, mount_path):
 
     if counter > 1:
         print(green(f"{counter} rows added to {output_csv}"))
+    else:
+        print(yellow("[-] No DB Leaks found."))
 
 def validate_litecoin_legacy(address):
     try:
@@ -3227,7 +3390,7 @@ def process_crypto_chunk(chunk, computer_name, files_to_search, bip39_words, csv
 
 
 def crypto_search(computer_name, mount_path, threads_number):
-    print(f"Looking now for crypto elements")
+    print(yellow(f"[!] Looking now for crypto elements"))
     output_file = f"{script_path}/{result_folder}/crypto.csv"
     files_to_search = [
         "wallet.dat", "electrum.dat", "default_wallet", "keystore", "wallet.json",
@@ -3332,6 +3495,147 @@ def crypto_search(computer_name, mount_path, threads_number):
             print(yellow(f"{output_file} should be empty"))
     except Exception as e:
         print(f"Error deduplicating CSV: {e}")
+
+
+def get_instant_messaging(computer_name, mount_path):
+    print(yellow(f"[!] Looking now for Instant Messaging elements"))
+    output_file = os.path.join(script_path, result_folder, "instant_messaging.csv")
+    csv_columns = ['computer_name', 'im_app', 'im_account', 'im_password', 'file_path']
+
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+        counter = 0
+
+        for root, dirs, files in os.walk(mount_path):
+            # ---- qTox ----
+            for file in files:
+                if file.endswith(".tox"):
+                    try:
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'im_app': 'qTox',
+                            'im_account': os.path.basename(file),
+                            'im_password': '',  # mdp non stocké en clair
+                            'file_path': os.path.join(root, file)
+                        })
+                        counter += 1
+                    except Exception as e:
+                        print(red(f"Error retrieving Psi+ information : {e}"))
+            # ---- Pidgin ----
+            if ".purple" in dirs:
+                accounts_file = os.path.join(root, ".purple", "accounts.xml")
+                if os.path.isfile(accounts_file):
+                    try:
+                        import xml.etree.ElementTree as ET
+                        tree = ET.parse(accounts_file)
+                        for account in tree.findall("account"):
+                            username = account.find("name").text if account.find("name") is not None else ""
+                            password = account.find("password").text if account.find("password") is not None else ""
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'im_app': 'Pidgin',
+                                'im_account': username,
+                                'im_password': password,
+                                'file_path': accounts_file
+                            })
+                            counter += 1
+                    except Exception as e:
+                        print(red(f"[-] Error parsing {accounts_file}: {e}"))
+
+            # ---- Gajim ----
+            if ".gajim" in dirs or "gajim" in dirs:
+                db_file = os.path.join(root, ".local", "share", "gajim", "accounts")
+                if not os.path.isfile(db_file):
+                    db_file = os.path.join(root, ".gajim", "accounts")
+                if os.path.isfile(db_file):
+                    try:
+                        conn = sqlite3.connect(db_file)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name, password FROM accounts")
+                        for acc, pwd in cursor.fetchall():
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'im_app': 'Gajim',
+                                'im_account': acc,
+                                'im_password': pwd,
+                                'file_path': db_file
+                            })
+                            counter += 1
+                        conn.close()
+                    except Exception as e:
+                        print(red(f"[-] Error parsing {db_file}: {e}"))
+
+            # ---- Profanity ----
+            if ".profanity" in dirs or "profanity" in dirs:
+                acc_file = os.path.join(root, ".profanity", "accounts")
+                if os.path.isfile(acc_file):
+                    try:
+                        with open(acc_file, "r", encoding="utf-8") as af:
+                            for line in af:
+                                if line.strip() and not line.startswith("#"):
+                                    parts = line.strip().split()
+                                    if len(parts) >= 2:
+                                        writer.writerow({
+                                            'computer_name': computer_name,
+                                            'im_app': 'Profanity',
+                                            'im_account': parts[0],
+                                            'im_password': parts[1] if len(parts) > 1 else '',
+                                            'file_path': acc_file
+                                        })
+                                        counter += 1
+                    except Exception as e:
+                        print(red(f"[-] Error reading {acc_file}: {e}"))
+
+            # ---- Telegram Desktop ----
+            if "tdata" in dirs:
+                try:
+                    tdata_path = os.path.join(root, "tdata")
+                    writer.writerow({
+                        'computer_name': computer_name,
+                        'im_app': 'Telegram Desktop',
+                        'im_account': '',
+                        'im_password': '',
+                        'file_path': tdata_path
+                    })
+                    counter += 1
+                except Exception as e:
+                    print(red(f"Error retrieving Telegram information : {e}"))
+            # ---- Discord ----
+            if "Discord" in dirs or ".discord" in dirs:
+                try:
+                    discord_path = os.path.join(root, "Discord")
+                    writer.writerow({
+                        'computer_name': computer_name,
+                        'im_app': 'Discord',
+                        'im_account': '',
+                        'im_password': '',
+                        'file_path': discord_path
+                    })
+                    counter += 1
+                except Exception as e:
+                    print(red(f"Error retrieving Discord information : {e}"))
+            # ---- Psi+ ----
+            if "psi+" in dirs or "psi-plus" in dirs or ".psi" in dirs or "psi" in dirs:
+                try:
+                    acc_file = os.path.join(root, ".psi", "accounts.xml")
+                    if os.path.isfile(acc_file):
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'im_app': 'Psi+',
+                            'im_account': '',
+                            'im_password': '',
+                            'file_path': acc_file
+                        })
+                        counter += 1
+                except Exception as e:
+                    print(red(f"Error retrieving Psi+ information : {e}"))
+
+    if counter >= 1:        
+        print(green(f"[+] Instant Messaging data have been written to {output_file} ({counter} rows)"))
+    else:
+        print(yellow(f"[-] No IM artefacts found."))
+
 
 def determine_platform(mount_path):
     linux_indicators = ['etc', 'var', 'usr']
@@ -3616,6 +3920,7 @@ if len(sys.argv) > 1:
             #create_volatility_profile(mount_path)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
+            get_instant_messaging(computer_name, mount_path)
         elif platform == "Windows":
             computer_name = get_windows_machine_name(mount_path)
             if image_path:
@@ -3636,13 +3941,17 @@ if len(sys.argv) > 1:
             hayabusa_evtx(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
+            get_instant_messaging(computer_name, mount_path)
         else:
             print(yellow("[!] Unknown OS"))
-            run_search = input("The mouting point isn't a filesystem, but do you can launch some files of interest research? It will be quite long? (yes/no): ").strip().lower()
+            run_search = input(f"The mouting point isn't a filesystem, but do you can launch some files of research on the {mount_path} directory ? It could be quite long? (yes/no): ").strip().lower()
             if run_search == "yes":
                 computer_name = "Unknown"
                 get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
+                get_browsing_history(mount_path, computer_name)
+                get_browsing_data(computer_name, mount_path)
                 find_potential_db_leaks(computer_name, mount_path)
+                get_instant_messaging(computer_name, mount_path)
                 
             else:
                 print("Script is going to exit.")
