@@ -2760,18 +2760,18 @@ def get_windows_browsing_data(mount_path, computer_name):
                 try:
                     for profile in os.listdir(firefox_login_path):
                         login_db_path = os.path.join(firefox_login_path, profile, 'logins.json')
+                        #firefox_root = firefox_login_path.split("Profiles")[0]
                         temp_file = f"/tmp/logins_firefox_{hash(login_db_path)}.json"
                         try:
                             print(yellow("[!] Trying to decrypt Firefox credentials"))
                             # trouver le dossier racine "firefox"
-                            firefox_root = os.path.join(firefox_login_path, profile)
-                            #print(firefox_root)
+                            print(firefox_root)
                             decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
 
                             try:
                                 # 1. Lister les profils
                                 list_profiles = subprocess.run(
-                                    ["python3", decrypt_script, firefox_root],
+                                    ["python3", decrypt_script, "-l", firefox_root],
                                     capture_output=True, text=True
                                 )
                             
@@ -2784,35 +2784,36 @@ def get_windows_browsing_data(mount_path, computer_name):
                                 if nb_profiles == 0:
                                     print(red("[-] No Firefox profiles found"))
                                 else:
-                                    #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
-                                    result = subprocess.run(
-                                        ["python3", decrypt_script, firefox_root],
-                                        capture_output=True, text=True
-                                    )
+                                    for idx in range(1, nb_profiles + 1):
+                                        #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
+                                        result = subprocess.run(
+                                            ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
+                                            capture_output=True, text=True
+                                        )
                              
-                                    lines = result.stdout.splitlines()
-                                    platform, ident, creds = "", "", ""
-                                    for line in lines:
-                                        if "Website:" in line:
-                                            platform = line.split("Website:")[1].strip()
-                                            #print(platform)
-                                        elif "Username:" in line:
-                                            ident = line.split("Username:")[1].strip(" '")
-                                        elif "Password:" in line:
-                                            creds = line.split("Password:")[1].strip(" '")
+                                        lines = result.stdout.splitlines()
+                                        platform, ident, creds = "", "", ""
+                                        for line in lines:
+                                            if "Website:" in line:
+                                                platform = line.split("Website:")[1].strip()
+                                                #print(platform)
+                                            elif "Username:" in line:
+                                                ident = line.split("Username:")[1].strip(" '")
+                                            elif "Password:" in line:
+                                                creds = line.split("Password:")[1].strip(" '")
  
-                                            writer.writerow({
-                                                'computer_name': computer_name,
-                                                'source': 'Firefox (decrypted)',
-                                                'user': user,
-                                                'ident': ident,
-                                                'creds': creds,
-                                                'platform': platform,
-                                                'saved_date': '',  # firefox_decrypt ne donne pas la date
-                                                'source_file': login_db_path,
-                                                'profile': profile
-                                            })
-                                            counter += 1
+                                                writer.writerow({
+                                                    'computer_name': computer_name,
+                                                    'source': 'Firefox (decrypted)',
+                                                    'user': user,
+                                                    'ident': ident,
+                                                    'creds': creds,
+                                                    'platform': platform,
+                                                    'saved_date': '',  # firefox_decrypt ne donne pas la date
+                                                    'source_file': login_db_path,
+                                                    'profile': profile
+                                                })
+                                                counter += 1
  
                             except Exception as e:
                                 print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
