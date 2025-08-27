@@ -1086,7 +1086,7 @@ def get_browsing_history(mount_path, computer_name):
 
 def get_browsing_data(computer_name, mount_path):
     output_file = os.path.join(script_path, result_folder, "browsing_data.csv")
-    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date']
+    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
     print(yellow("[!] Retrieving browsing datas"))
 
     counter = 0
@@ -1121,7 +1121,9 @@ def get_browsing_data(computer_name, mount_path):
                                 'ident': username or '',
                                 'creds': password or '',  # chiffré
                                 'platform': url or '',
-                                'saved_date': convert_chrome_time(date_created) if date_created else ''
+                                'saved_date': convert_chrome_time(date_created) if date_created else '',
+                                'source_file': chrome_login_path,
+                                'profile': 'unknown'
                             })
                             counter += 1
                     except Exception as e:
@@ -1137,7 +1139,9 @@ def get_browsing_data(computer_name, mount_path):
                                 'ident': username or '',
                                 'creds': '',
                                 'platform': url or '',
-                                'saved_date': convert_chrome_time(update_time) if update_time else ''
+                                'saved_date': convert_chrome_time(update_time) if update_time else '',
+                                'source_file': chrome_login_path,
+                                'profile': 'unknown'
                             })
                             counter += 1
                     except:
@@ -1146,12 +1150,67 @@ def get_browsing_data(computer_name, mount_path):
                     conn.close()
                 except Exception as e:
                     print(red(f"[-] Error processing Chrome logins at {chrome_login_path}: {e}"))
-
             # ---- Firefox ----
             if "logins.json" in files:
                 firefox_login_path = os.path.join(root, "logins.json")
                 temp_file = f"/tmp/logins_firefox_{hash(firefox_login_path)}.json"
                 try:
+                    print(yellow("[!] Trying to decrypt Firefox credentials"))
+                    # trouver le dossier racine "firefox"
+                    firefox_root = firefox_login_path.split("firefox")[0] + "firefox"
+                    #print(firefox_root)
+                    decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
+
+                    try:
+                        # 1. Lister les profils
+                        list_profiles = subprocess.run(
+                            ["python3", decrypt_script, "-l", firefox_root],
+                            capture_output=True, text=True
+                        )
+                    
+                        if list_profiles.returncode != 0:
+                            raise Exception(list_profiles.stderr.strip())
+                    
+                        profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
+                        nb_profiles = len(profile_lines)
+                    
+                        if nb_profiles == 0:
+                            print(red("[-] No Firefox profiles found"))
+                        else:
+                            for idx in range(1, nb_profiles + 1):
+                                #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
+                                result = subprocess.run(
+                                    ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
+                                    capture_output=True, text=True
+                                )
+                    
+                                lines = result.stdout.splitlines()
+                                platform, ident, creds = "", "", ""
+                                for line in lines:
+                                    if "Website:" in line:
+                                        platform = line.split("Website:")[1].strip()
+                                    elif "Username:" in line:
+                                        ident = line.split("Username:")[1].strip(" '")
+                                    elif "Password:" in line:
+                                        creds = line.split("Password:")[1].strip(" '")
+
+                                        writer.writerow({
+                                            'computer_name': computer_name,
+                                            'source': 'Firefox (decrypted)',
+                                            'user': user,
+                                            'ident': ident,
+                                            'creds': creds,
+                                            'platform': platform,
+                                            'saved_date': '',  # firefox_decrypt ne donne pas la date
+                                            'source_file': firefox_login_path,
+                                            'profile': os.path.basename(root)
+                                        })
+                                        counter += 1
+
+                    except Exception as e:
+                        print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
+
+                    ##mettre la référence chiffrée quand même
                     shutil.copyfile(firefox_login_path, temp_file)
                     with open(temp_file, 'r', encoding='utf-8') as jf:
                         data = json.load(jf)
@@ -1166,11 +1225,17 @@ def get_browsing_data(computer_name, mount_path):
                                 'ident': entry.get('usernameField', '') or entry.get('encryptedUsername', ''),
                                 'creds': entry.get('passwordField', '') or entry.get('encryptedPassword', ''),  # chiffré
                                 'platform': entry.get('hostname', ''),
-                                'saved_date': saved
+                                'saved_date': saved,
+                                'source_file': firefox_login_path,
+                                'profile': 'default'
                             })
                             counter += 1
+
                 except Exception as e:
-                    print(red(f"[-] Error processing Firefox logins at {firefox_login_path}: {e}"))
+                    print(red(f"[-] Error processing firefox browsing data: {e}"))
+
+
+
 
     if counter:
         print(green(f"[+] Browsing data written to {output_file} ({counter} rows)"))
@@ -1249,7 +1314,7 @@ def get_linux_browsing_history(mount_path, computer_name):
 
 def get_linux_browsing_data(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_browsing_data.csv"
-    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date']
+    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
     print(yellow("[+] Retrieving browsing data (saved logins)"))
 
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
@@ -1311,21 +1376,87 @@ def get_linux_browsing_data(mount_path, computer_name):
                     for profile in os.listdir(firefox_profile_dir):
                         profile_dir = os.path.join(firefox_profile_dir, profile)
                         if os.path.isdir(profile_dir) and profile.endswith('.default-release'):
-                            login_db_path = os.path.join(profile_dir, 'logins.json')
-                            if os.path.exists(login_db_path):
-                                with open(login_db_path, 'r', encoding='utf-8') as login_file:
-                                    logins = json.load(login_file).get('logins', [])
-                                    for login in logins:
+                            firefox_login_path = os.path.join(profile_dir, 'logins.json')
+                            temp_file = f"/tmp/logins_firefox_{hash(firefox_login_path)}.json"
+                            try:
+                                print(yellow("[!] Trying to decrypt Firefox credentials"))
+                                # trouver le dossier racine "firefox"
+                                firefox_root = firefox_login_path.split("firefox")[0] + "firefox"
+                                #print(firefox_root)
+                                decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
+
+                                try:
+                                    # 1. Lister les profils
+                                    list_profiles = subprocess.run(
+                                        ["python3", decrypt_script, "-l", firefox_root],
+                                        capture_output=True, text=True
+                                    )
+                                
+                                    if list_profiles.returncode != 0:
+                                        raise Exception(list_profiles.stderr.strip())
+                                
+                                    profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
+                                    nb_profiles = len(profile_lines)
+                                
+                                    if nb_profiles == 0:
+                                        print(red("[-] No Firefox profiles found"))
+                                    else:
+                                        for idx in range(1, nb_profiles + 1):
+                                            #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
+                                            result = subprocess.run(
+                                                ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
+                                                capture_output=True, text=True
+                                            )
+                                
+                                            lines = result.stdout.splitlines()
+                                            platform, ident, creds = "", "", ""
+                                            for line in lines:
+                                                if "Website:" in line:
+                                                    platform = line.split("Website:")[1].strip()
+                                                elif "Username:" in line:
+                                                    ident = line.split("Username:")[1].strip(" '")
+                                                elif "Password:" in line:
+                                                    creds = line.split("Password:")[1].strip(" '")
+
+                                                    writer.writerow({
+                                                        'computer_name': computer_name,
+                                                        'source': 'Firefox (decrypted)',
+                                                        'user': user,
+                                                        'ident': ident,
+                                                        'creds': creds,
+                                                        'platform': platform,
+                                                        'saved_date': '',  # firefox_decrypt ne donne pas la date
+                                                        'source_file': firefox_login_path,
+                                                        'profile': os.path.basename(root)
+                                                    })
+                                                    counter += 1
+
+                                except Exception as e:
+                                    print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
+
+                                ##mettre la référence chiffrée quand même
+                                shutil.copyfile(firefox_login_path, temp_file)
+                                with open(temp_file, 'r', encoding='utf-8') as jf:
+                                    data = json.load(jf)
+                                    logins = data.get('logins', [])
+                                    for entry in logins:
+                                        ts = entry.get('timeCreated')
+                                        saved = datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ''
                                         writer.writerow({
                                             'computer_name': computer_name,
                                             'source': 'Firefox',
                                             'user': user,
-                                            'ident': login.get('usernameField', ''),
-                                            'creds': login.get('passwordField', ''),  # Encrypted; requires further processing to decrypt
-                                            'platform': login.get('hostname', ''),
-                                            'saved_date': datetime.fromtimestamp(login['timeCreated'] / 1000).isoformat()
+                                            'ident': entry.get('usernameField', '') or entry.get('encryptedUsername', ''),
+                                            'creds': entry.get('passwordField', '') or entry.get('encryptedPassword', ''),  # chiffré
+                                            'platform': entry.get('hostname', ''),
+                                            'saved_date': saved,
+                                            'source_file': firefox_login_path,
+                                            'profile': 'default'
                                         })
                                         counter += 1
+
+                            except Exception as e:
+                                print(red(f"[-] Error processing firefox browsing data: {e}"))
 
                 except Exception as e:
                     print(red(f"[-] Error processing Firefox logins for user {user}: {e}"))
@@ -1333,8 +1464,7 @@ def get_linux_browsing_data(mount_path, computer_name):
         print(green(f"Browsing data has been written into {output_file}"))
     else:
         print(yellow(f"No browsing data found, {output_file} should be empty"))
-
-
+            
 def parse_crontab_line(line, is_user_crontab=False):
     parts = line.split()
     if len(parts) < (6 if not is_user_crontab else 5):
@@ -2569,7 +2699,7 @@ def get_windows_browsing_history(mount_path, computer_name):
 
 def get_windows_browsing_data(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "windows_browsing_data.csv"
-    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date']
+    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
     print(yellow("[+] Retrieving browsing data (saved logins)"))
     
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
@@ -2630,6 +2760,89 @@ def get_windows_browsing_data(mount_path, computer_name):
                 try:
                     for profile in os.listdir(firefox_login_path):
                         login_db_path = os.path.join(firefox_login_path, profile, 'logins.json')
+                        temp_file = f"/tmp/logins_firefox_{hash(login_db_path)}.json"
+                        try:
+                            print(yellow("[!] Trying to decrypt Firefox credentials"))
+                            # trouver le dossier racine "firefox"
+                            firefox_root = os.path.join(firefox_login_path, profile)
+                            #print(firefox_root)
+                            decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
+
+                            try:
+                                # 1. Lister les profils
+                                list_profiles = subprocess.run(
+                                    ["python3", decrypt_script, firefox_root],
+                                    capture_output=True, text=True
+                                )
+                            
+                                if list_profiles.returncode != 0:
+                                    raise Exception(list_profiles.stderr.strip())
+                            
+                                profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
+                                nb_profiles = len(profile_lines)
+                            
+                                if nb_profiles == 0:
+                                    print(red("[-] No Firefox profiles found"))
+                                else:
+                                    #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
+                                    result = subprocess.run(
+                                        ["python3", decrypt_script, firefox_root],
+                                        capture_output=True, text=True
+                                    )
+                             
+                                    lines = result.stdout.splitlines()
+                                    platform, ident, creds = "", "", ""
+                                    for line in lines:
+                                        if "Website:" in line:
+                                            platform = line.split("Website:")[1].strip()
+                                            #print(platform)
+                                        elif "Username:" in line:
+                                            ident = line.split("Username:")[1].strip(" '")
+                                        elif "Password:" in line:
+                                            creds = line.split("Password:")[1].strip(" '")
+ 
+                                            writer.writerow({
+                                                'computer_name': computer_name,
+                                                'source': 'Firefox (decrypted)',
+                                                'user': user,
+                                                'ident': ident,
+                                                'creds': creds,
+                                                'platform': platform,
+                                                'saved_date': '',  # firefox_decrypt ne donne pas la date
+                                                'source_file': login_db_path,
+                                                'profile': profile
+                                            })
+                                            counter += 1
+ 
+                            except Exception as e:
+                                print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
+
+                            ##mettre la référence chiffrée quand même
+                            shutil.copyfile(login_db_path, temp_file)
+                            with open(temp_file, 'r', encoding='utf-8') as jf:
+                                data = json.load(jf)
+                                logins = data.get('logins', [])
+                                for entry in logins:
+                                    ts = entry.get('timeCreated')
+                                    saved = datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ''
+                                    writer.writerow({
+                                        'computer_name': computer_name,
+                                        'source': 'Firefox',
+                                        'user': user,
+                                        'ident': entry.get('usernameField', '') or entry.get('encryptedUsername', ''),
+                                        'creds': entry.get('passwordField', '') or entry.get('encryptedPassword', ''),  # chiffré
+                                        'platform': entry.get('hostname', ''),
+                                        'saved_date': saved,
+                                        'source_file': login_db_path,
+                                        'profile': 'default'
+                                    })
+                                    counter += 1
+
+                        except Exception as e:
+                            print(red(f"[-] Error processing firefox browsing data: {e}"))
+
+
+
                         if os.path.exists(login_db_path):
                             with open(login_db_path, 'r', encoding='utf-8') as login_file:
                                 logins = json.load(login_file).get('logins', [])

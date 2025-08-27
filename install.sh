@@ -3,6 +3,7 @@
 HAYABUSA_URL="https://github.com/Yamato-Security/hayabusa/releases/download/v3.4.0/hayabusa-3.4.0-lin-x64-gnu.zip"
 ANALYZE_MFT_URL="https://github.com/rowingdude/analyzeMFT.git"
 PYTHON_REGISTRY_URL="https://github.com/williballenthin/python-registry.git"
+FIREFOX_DECRYPT_URL="https://raw.githubusercontent.com/unode/firefox_decrypt/refs/heads/main/firefox_decrypt.py"
 VENV_PATH="${PWD}/MaT_venv"
 
 YELLOW='\033[1;33m'
@@ -126,7 +127,12 @@ if ! command -v regripper >/dev/null 2>&1; then
         echo -e "${GREEN}[+] regripper a été installé avec succès !${NC}"
 fi
 
-
+if [ ! -f "./firefox_decrypt.py" ]; then
+    echo -e "${YELLOW} firefox_decrypt.py est manquant dans le dossier courant ${NC}" >&2
+    echo -e "${YELLOW}[*] Téléchargement de l'outil ${NC}"
+    wget "${FIREFOX_DECRYPT_URL}" -O firefox_decrypt.py
+    
+fi
 
 echo -e "${GREEN}[+] Installation terminée. ${NC}"
 
