@@ -1245,40 +1245,46 @@ def get_browsing_data(computer_name, mount_path):
 
 def get_linux_browsing_history(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_browsing_history.csv"
-    csv_columns = ['computer_name', 'source', 'user', 'url_title', 'link', 'search_date']
-    print(yellow("[+] Retrieving browsing history"))
+    csv_columns = ['computer_name', 'source', 'user', 'url_title', 'link', 'search_date', 'source_file']
+    print(yellow("[!] Retrieving browsing history"))
+    counter = 0
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=csv_columns)
         writer.writeheader()
         users_dir = os.path.join(mount_path, 'home')
+
         for user in os.listdir(users_dir):
             user_dir = os.path.join(users_dir, user)
-            find_firefox_cmd = f"find {user_dir} -type f -name 'places.sqlite' "
-            stdout, stderr = chroot_and_run_command(mount_path, find_firefox_cmd)
-            firefox_files = stdout.splitlines()
-       
-            for firefox_file in firefox_files:
-                if not firefox_file:
-                    print(red("[-] No Firefox profile found."))
-                    return
-                # Chemin du fichier temporaire
-                temp_file = "/tmp/places_temp.sqlite"
 
-                # Chemin complet du fichier 'places.sqlite' à partir de l'image montée
+            # Recherche des fichiers places.sqlite sans chroot
+            firefox_files = []
+            chrome_files = []
+            for root, dirs, files in os.walk(user_dir):
+                for filename in files:
+                    if filename == "places.sqlite":
+                        rel_path = os.path.join(root, filename)
+                        firefox_files.append(rel_path)
+                    if filename == "History":
+                        rel_path = os.path.join(root, filename)
+                        chrome_files.append(rel_path)
+
+            if not firefox_files:
+                print(red(f"[-] No Firefox profile found for {user}."))
+
+            if not chrome_files:
+                print(red(f"[-] No Chrome profile found for {user}."))
+
+            for firefox_file in firefox_files:
+                temp_file = "/tmp/places_temp.sqlite"
                 firefox_profile_file = os.path.join(mount_path, firefox_file)
-                firefox_profile_file = os.path.normpath(firefox_profile_file)
 
                 try:
-                    # Copier le fichier places.sqlite dans /tmp
                     shutil.copyfile(firefox_profile_file, temp_file)
                     print(yellow(f"[+] Copied Firefox history to temporary file: {temp_file}"))
 
-                    # Ouvrir le fichier CSV pour écrire les résultats
-                    # Connexion à la copie temporaire de la base de données Firefox
                     conn = sqlite3.connect(temp_file)
                     cursor = conn.cursor()
 
-                    # Requête pour récupérer l'historique de navigation
                     cursor.execute("""
                         SELECT moz_places.url, moz_places.title, moz_historyvisits.visit_date
                         FROM moz_places, moz_historyvisits
@@ -1286,31 +1292,51 @@ def get_linux_browsing_history(mount_path, computer_name):
                     """)
                     firefox_rows = cursor.fetchall()
 
-                    # Traiter les résultats et les écrire dans le fichier CSV
                     for row in firefox_rows:
                         url, url_title, visit_time = row
                         visit_date = convert_firefox_time(visit_time)
                         writer.writerow({
                             'computer_name': computer_name,
                             'source': 'Firefox',
-                            'user': user,  # Ajuste le nom de l'utilisateur si nécessaire
+                            'user': user,
                             'url_title': url_title,
                             'link': url,
-                            'search_date': visit_date
+                            'search_date': visit_date,
+                            'source_file': firefox_file
                         })
+                        counter += 1
 
-                        # Fermer la connexion à la base de données
                     conn.close()
-                    print(green(f"Browsing history has been written into {output_file}"))
 
                 except Exception as e:
                     print(red(f"[-] Error processing Firefox history: {e}"))
 
                 finally:
-                    # Supprimer le fichier temporaire après utilisation
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
                         print(yellow(f"[+] Temporary file {temp_file} has been deleted."))
+
+            for chrome_file in chrome_files:
+                if os.path.exists(chrome_file):
+                    try:
+                        print(chrome_file)
+                        conn = sqlite3.connect(chrome_file)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT urls.url, urls.title, visits.visit_time FROM urls, visits WHERE urls.id = visits.url")
+                        for url, url_title, visit_time in cursor.fetchall():
+                            visit_date = convert_chrome_time(visit_time)
+                            writer.writerow({
+                                'computer_name': computer_name, 'source': 'Chrome', 'user': user,
+                                'link': url, 'url_title': url_title, 'search_date': visit_date, 'source_file': chrome_file
+                            })
+                            counter += 1
+                        conn.close()
+                    except Exception as e:
+                        print(red(f"Error processing Chrome history: {e}"))
+    if counter > 1:
+        print(green(f"[+] Browsing history has been written into {output_file} ({counter} rows)"))
+
+
 
 def get_linux_browsing_data(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_browsing_data.csv"
@@ -4118,22 +4144,21 @@ if len(sys.argv) > 1:
             computer_name = get_system_info(mount_path)
             if image_path:
                 get_inode_table(computer_name, real_image, sub_part, byte_offset, image_format)
-                #get_inode_table(computer_name, sub_part)
-            get_network_info(mount_path, computer_name)
-            get_users_and_groups(mount_path, computer_name)
-            list_installed_apps(mount_path, computer_name)
-            list_connections(mount_path, computer_name)
-            list_services(mount_path, computer_name)
-            get_command_history(mount_path, computer_name)
-            get_firewall_rules(mount_path, computer_name)
-            get_linux_used_space(mount_path, computer_name)
-            get_linux_docker(mount_path, computer_name)
+            #get_network_info(mount_path, computer_name)
+            #get_users_and_groups(mount_path, computer_name)
+            #list_installed_apps(mount_path, computer_name)
+            #list_connections(mount_path, computer_name)
+            #list_services(mount_path, computer_name)
+            #get_command_history(mount_path, computer_name)
+            #get_firewall_rules(mount_path, computer_name)
+            #get_linux_used_space(mount_path, computer_name)
+            #get_linux_docker(mount_path, computer_name)
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)
-            get_linux_crontab(mount_path, computer_name)
+            #get_linux_crontab(mount_path, computer_name)
             #create_volatility_profile(mount_path)
-            get_files_of_interest(mount_path, computer_name, threads_number, platform)
-            find_potential_db_leaks(computer_name, mount_path)
+            #get_files_of_interest(mount_path, computer_name, threads_number, platform)
+            #find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
         elif platform == "Windows":
             computer_name = get_windows_machine_name(mount_path)
