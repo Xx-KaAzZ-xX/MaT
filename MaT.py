@@ -3972,6 +3972,7 @@ def get_mft(computer_name, image_path, byte_offset):
 
         # Analyse avec analyzeMFT.py
         os.system(f"analyzeMFT.py -f {mft_raw_path} -o {mft_csv_path} -p")
+        #os.system(f"analyzemft -f {mft_raw_path} -o {mft_csv_path}")
         if os.path.exists(mft_csv_path):
             df = pd.read_csv(mft_csv_path)
             df['computer_name'] = computer_name
@@ -4144,21 +4145,21 @@ if len(sys.argv) > 1:
             computer_name = get_system_info(mount_path)
             if image_path:
                 get_inode_table(computer_name, real_image, sub_part, byte_offset, image_format)
-            #get_network_info(mount_path, computer_name)
-            #get_users_and_groups(mount_path, computer_name)
-            #list_installed_apps(mount_path, computer_name)
-            #list_connections(mount_path, computer_name)
-            #list_services(mount_path, computer_name)
-            #get_command_history(mount_path, computer_name)
-            #get_firewall_rules(mount_path, computer_name)
-            #get_linux_used_space(mount_path, computer_name)
-            #get_linux_docker(mount_path, computer_name)
+            get_network_info(mount_path, computer_name)
+            get_users_and_groups(mount_path, computer_name)
+            list_installed_apps(mount_path, computer_name)
+            list_connections(mount_path, computer_name)
+            list_services(mount_path, computer_name)
+            get_command_history(mount_path, computer_name)
+            get_firewall_rules(mount_path, computer_name)
+            get_linux_used_space(mount_path, computer_name)
+            get_linux_docker(mount_path, computer_name)
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)
-            #get_linux_crontab(mount_path, computer_name)
+            get_linux_crontab(mount_path, computer_name)
             #create_volatility_profile(mount_path)
-            #get_files_of_interest(mount_path, computer_name, threads_number, platform)
-            #find_potential_db_leaks(computer_name, mount_path)
+            get_files_of_interest(mount_path, computer_name, threads_number, platform)
+            find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
         elif platform == "Windows":
             computer_name = get_windows_machine_name(mount_path)
