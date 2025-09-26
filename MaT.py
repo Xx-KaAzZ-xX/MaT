@@ -1160,55 +1160,57 @@ def get_browsing_data(computer_name, mount_path):
                     firefox_root = firefox_login_path.split("firefox")[0] + "firefox"
                     #print(firefox_root)
                     decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
+                    if os.path.exists(decrypt_script):
+                        try:
+                            # 1. Lister les profils
+                            list_profiles = subprocess.run(
+                                ["python3", decrypt_script, "-l", firefox_root],
+                                capture_output=True, text=True
+                            )
+                    
+                            if list_profiles.returncode != 0:
+                                raise Exception(list_profiles.stderr.strip())
+                    
+                            profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
+                            nb_profiles = len(profile_lines)
+                    
+                            if nb_profiles == 0:
+                                print(red("[-] No Firefox profiles found"))
+                            else:
+                                for idx in range(1, nb_profiles + 1):
+                                    #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
+                                    result = subprocess.run(
+                                        ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
+                                        capture_output=True, text=True
+                                    )
+                    
+                                    lines = result.stdout.splitlines()
+                                    platform, ident, creds = "", "", ""
+                                    for line in lines:
+                                        if "Website:" in line:
+                                            platform = line.split("Website:")[1].strip()
+                                        elif "Username:" in line:
+                                            ident = line.split("Username:")[1].strip(" '")
+                                        elif "Password:" in line:
+                                            creds = line.split("Password:")[1].strip(" '")
 
-                    try:
-                        # 1. Lister les profils
-                        list_profiles = subprocess.run(
-                            ["python3", decrypt_script, "-l", firefox_root],
-                            capture_output=True, text=True
-                        )
-                    
-                        if list_profiles.returncode != 0:
-                            raise Exception(list_profiles.stderr.strip())
-                    
-                        profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
-                        nb_profiles = len(profile_lines)
-                    
-                        if nb_profiles == 0:
-                            print(red("[-] No Firefox profiles found"))
-                        else:
-                            for idx in range(1, nb_profiles + 1):
-                                #print(yellow(f"[!] Decrypting profile {idx}/{nb_profiles}"))
-                                result = subprocess.run(
-                                    ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
-                                    capture_output=True, text=True
-                                )
-                    
-                                lines = result.stdout.splitlines()
-                                platform, ident, creds = "", "", ""
-                                for line in lines:
-                                    if "Website:" in line:
-                                        platform = line.split("Website:")[1].strip()
-                                    elif "Username:" in line:
-                                        ident = line.split("Username:")[1].strip(" '")
-                                    elif "Password:" in line:
-                                        creds = line.split("Password:")[1].strip(" '")
+                                            writer.writerow({
+                                                'computer_name': computer_name,
+                                                'source': 'Firefox (decrypted)',
+                                                'user': user,
+                                                'ident': ident,
+                                                'creds': creds,
+                                                'platform': platform,
+                                                'saved_date': '',  # firefox_decrypt ne donne pas la date
+                                                'source_file': firefox_login_path,
+                                                'profile': os.path.basename(root)
+                                            })
+                                            counter += 1
 
-                                        writer.writerow({
-                                            'computer_name': computer_name,
-                                            'source': 'Firefox (decrypted)',
-                                            'user': user,
-                                            'ident': ident,
-                                            'creds': creds,
-                                            'platform': platform,
-                                            'saved_date': '',  # firefox_decrypt ne donne pas la date
-                                            'source_file': firefox_login_path,
-                                            'profile': os.path.basename(root)
-                                        })
-                                        counter += 1
-
-                    except Exception as e:
-                        print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
+                        except Exception as e:
+                            print(red(f"[-] Error decrypting with firefox_decrypt.py: {e}"))
+                    else:
+                        print(red(f"[-] firefox_decrypt.py is not in the current directory"))
 
                     ##mettre la référence chiffrée quand même
                     shutil.copyfile(firefox_login_path, temp_file)
@@ -1280,7 +1282,7 @@ def get_linux_browsing_history(mount_path, computer_name):
 
                 try:
                     shutil.copyfile(firefox_profile_file, temp_file)
-                    print(yellow(f"[+] Copied Firefox history to temporary file: {temp_file}"))
+                    print(yellow(f"[!] Copied Firefox history to temporary file: {temp_file}"))
 
                     conn = sqlite3.connect(temp_file)
                     cursor = conn.cursor()
@@ -1314,12 +1316,11 @@ def get_linux_browsing_history(mount_path, computer_name):
                 finally:
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
-                        print(yellow(f"[+] Temporary file {temp_file} has been deleted."))
+                        print(yellow(f"[!] Temporary file {temp_file} has been deleted."))
 
             for chrome_file in chrome_files:
                 if os.path.exists(chrome_file):
                     try:
-                        print(chrome_file)
                         conn = sqlite3.connect(chrome_file)
                         cursor = conn.cursor()
                         cursor.execute("SELECT urls.url, urls.title, visits.visit_time FROM urls, visits WHERE urls.id = visits.url")
@@ -3830,7 +3831,28 @@ def get_instant_messaging(computer_name, mount_path):
             # ---- Telegram Desktop ----
             if "tdata" in dirs:
                 try:
+                    from opentele.td import TDesktop
                     tdata_path = os.path.join(root, "tdata")
+                    try:
+                        tdesk = TDesktop(tdata_path)
+                    except BaseException as tdesktop_error:
+                        print(red(f"[!] Impossible de charger {tdata_path} : {tdesktop_error}"))
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'im_app': 'Telegram Desktop',
+                            'im_account': '',
+                            'im_password': '',
+                            'file_path': tdata_path
+                        })
+                        counter += 1
+                        continue
+                    if not tdesk.isLoaded():
+                        print(f"[!] Impossible de charger {tdata_path}")
+                    else:
+                        for account in tdesk.accounts:
+                            print(f"Telegram account ID : {account.UserId}")
+                            print(account.MainDcId)
+                            print(f"Datacenter ID      : {account.MainDcId}")
                     writer.writerow({
                         'computer_name': computer_name,
                         'im_app': 'Telegram Desktop',
@@ -3842,7 +3864,7 @@ def get_instant_messaging(computer_name, mount_path):
                 except Exception as e:
                     print(red(f"Error retrieving Telegram information : {e}"))
             # ---- Discord ----
-            if "Discord" in dirs or ".discord" in dirs:
+            if "Discord" in dirs:
                 try:
                     discord_path = os.path.join(root, "Discord")
                     writer.writerow({
@@ -3853,6 +3875,33 @@ def get_instant_messaging(computer_name, mount_path):
                         'file_path': discord_path
                     })
                     counter += 1
+                except Exception as e:
+                    print(red(f"Error retrieving Discord information : {e}"))
+
+            if "discord" in dirs:
+                user_id = ""
+                email = ""
+                username = ""
+                token = ""
+                try:
+                    leveldb_dir = os.path.join(root, "discord", "Local Storage", "leveldb")
+                    scope_file = os.path.join(root, "discord", "sentry", "scope_v3.json")
+                    if os.path.exists(scope_file):
+                        with open(scope_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        user_id = data.get("scope", {}).get("user", {}).get("id", "")
+                        email = data.get("scope", {}).get("user", {}).get("email", "")
+                        username = data.get("scope", {}).get("user", {}).get("username", "")
+                    if user_id:
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'im_app': 'Discord',
+                            'im_account': f"{user_id};{email}",
+                            'im_password': token,
+                            'file_path': f"{scope_file}"
+                        })
+                        counter += 1
+
                 except Exception as e:
                     print(red(f"Error retrieving Discord information : {e}"))
             # ---- Psi+ ----
@@ -3870,7 +3919,59 @@ def get_instant_messaging(computer_name, mount_path):
                         counter += 1
                 except Exception as e:
                     print(red(f"Error retrieving Psi+ information : {e}"))
-
+            if "Slack" in dirs:
+                #print(root)
+                try:
+                    leveldb_dir = os.path.join(root, "Slack", "Local Storage", "leveldb")
+                    if os.path.isdir(leveldb_dir):
+                        #print(leveldb_dir)
+                        user_id = None
+                        user_file = None
+                        token = None
+                        token_file = None
+            
+                        # Parcourt tous les fichiers dans leveldb
+                        for fname in os.listdir(leveldb_dir):
+                            fpath = os.path.join(leveldb_dir, fname)
+            
+                            # Recherche user_id dans fichiers log
+                            if fname.endswith(".log"):
+                                try:
+                                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                        content = f.read()
+                                        match = re.search(r'"user_id"\s*:\s*"([A-Z0-9]+)"', content)
+                                        if match:
+                                            user_id = match.group(1)
+                                            user_file = fpath
+                                except Exception:
+                                    continue
+            
+                            # Recherche token xoxc dans fichiers .ldb
+                            elif fname.endswith(".ldb"):
+                                try:
+                                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                        content = f.read()
+                                        match = re.search(r'(xoxc-[A-Za-z0-9\-]+)', content)
+                                        if match:
+                                            token = match.group(1)
+                                            token_file = fpath
+                                except Exception:
+                                    continue
+            
+                        # Écrit dans le CSV si trouvé
+                        if user_id and token:
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'im_app': 'Slack',
+                                'im_account': user_id,
+                                'im_password': token,
+                                'file_path': f"{user_file};{token_file}"
+                            })
+                            counter += 1
+            
+                except Exception as e:
+                    print(red(f"Error retrieving Slack information : {e}"))
+            
     if counter >= 1:        
         print(green(f"[+] Instant Messaging data have been written to {output_file} ({counter} rows)"))
     else:
@@ -4152,7 +4253,7 @@ if len(sys.argv) > 1:
             list_services(mount_path, computer_name)
             get_command_history(mount_path, computer_name)
             get_firewall_rules(mount_path, computer_name)
-            get_linux_used_space(mount_path, computer_name)
+            #get_linux_used_space(mount_path, computer_name)
             get_linux_docker(mount_path, computer_name)
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)

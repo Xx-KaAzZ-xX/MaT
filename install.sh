@@ -65,7 +65,8 @@ pip3 install \
     tabulate \
     pycryptodome \
     safe-pysha3 \
-    lxml
+    lxml \
+    opentele
 
 echo -e "${YELLOW}[*] Installation de python-registry...${NC}"
 git clone https://github.com/williballenthin/python-registry.git /tmp/python-registry
