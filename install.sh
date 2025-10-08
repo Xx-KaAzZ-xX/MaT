@@ -34,6 +34,7 @@ sudo apt-get install -y \
     libmagic1 \
     libssl-dev \
     libffi-dev \
+    sleuthkit \
     python3-setuptools \
     python3-distutils \
     libfuse2 \
