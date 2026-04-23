@@ -36,7 +36,7 @@ sudo apt-get install -y \
     libffi-dev \
     sleuthkit \
     python3-setuptools \
-    python3-distutils \
+    python3-distutils-extra \
     libfuse2 \
     unzip \
     git \
@@ -61,6 +61,7 @@ pip3 install \
     pyyaml \
     base58 \
     bech32 \
+    setuptools \
     bitcoinaddress \
     mnemonic \
     tabulate \
