@@ -5,6 +5,7 @@ ANALYZE_MFT_URL="https://github.com/rowingdude/analyzeMFT.git"
 PYTHON_REGISTRY_URL="https://github.com/williballenthin/python-registry.git"
 FIREFOX_DECRYPT_URL="https://raw.githubusercontent.com/unode/firefox_decrypt/refs/heads/main/firefox_decrypt.py"
 VENV_PATH="${PWD}/MaT_venv"
+CUR_DIR="/root/SCRIPTS/MaT"
 
 YELLOW='\033[1;33m'
 GREEN='\033[1;32m'
@@ -27,6 +28,7 @@ check_distrib
 echo -e "${YELLOW}[*] Installation des paquets système requis...${NC}"
 sudo apt-get update
 sudo apt-get install -y \
+    yara \
     python3 python3-pip \
     python3-dev \
     python3-venv \
@@ -78,11 +80,11 @@ cd
 rm -rf /tmp/python-registry
 
 echo -e "${YELLOW} [*] Vérification des dépendances locales... ${NC}"
-if [ ! -d "./hayabusa" ]; then
+if [ ! -d "${CUR_DIR}/hayabusa" ]; then
     echo -e "${YELLOW} hayabusa est manquant dans le dossier courant ${NC}" >&2
-    mkdir hayabusa
+    mkdir ${CUR_DIR}/hayabusa
     echo -e "${YELLOW}[*] Téléchargement de hayabusa...${NC}"
-    cd hayabusa
+    cd ${CUR_DIR}/hayabusa
     wget "${HAYABUSA_URL}" -O hayabusa.zip
     unzip hayabusa.zip >/dev/null 2>&1
     rm hayabusa.zip
@@ -133,7 +135,7 @@ fi
 if [ ! -f "./firefox_decrypt.py" ]; then
     echo -e "${YELLOW} firefox_decrypt.py est manquant dans le dossier courant ${NC}" >&2
     echo -e "${YELLOW}[*] Téléchargement de l'outil ${NC}"
-    wget "${FIREFOX_DECRYPT_URL}" -O "${PWD}/firefox_decrypt.py"
+    wget "${FIREFOX_DECRYPT_URL}" -O "${CUR_DIR}/firefox_decrypt.py"
     
 fi
 
