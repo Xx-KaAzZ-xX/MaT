@@ -64,6 +64,7 @@ pip3 install \
     base58 \
     bech32 \
     setuptools \
+    pyhindsight \
     bitcoinaddress \
     mnemonic \
     tabulate \
