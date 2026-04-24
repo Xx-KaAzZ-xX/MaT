@@ -4,6 +4,7 @@ HAYABUSA_URL="https://github.com/Yamato-Security/hayabusa/releases/download/v3.4
 ANALYZE_MFT_URL="https://github.com/rowingdude/analyzeMFT.git"
 PYTHON_REGISTRY_URL="https://github.com/williballenthin/python-registry.git"
 FIREFOX_DECRYPT_URL="https://raw.githubusercontent.com/unode/firefox_decrypt/refs/heads/main/firefox_decrypt.py"
+HINDSIGHT_URL="https://github.com/RyanDFIR/hindsight.git"
 VENV_PATH="${PWD}/MaT_venv"
 CUR_DIR="/root/SCRIPTS/MaT"
 
@@ -65,6 +66,7 @@ pip3 install \
     bech32 \
     setuptools \
     pyhindsight \
+    git+https://github.com/cclgroupltd/ccl_chromium_reader.git\
     bitcoinaddress \
     mnemonic \
     tabulate \
@@ -139,6 +141,16 @@ if [ ! -f "./firefox_decrypt.py" ]; then
     wget "${FIREFOX_DECRYPT_URL}" -O "${CUR_DIR}/firefox_decrypt.py"
     
 fi
+
+if [ ! -d "${CUR_DIR}/hindsight" ]; then
+    echo -e "${YELLOW} hindsight est manquant dans le dossier courant ${NC}" >&2
+    git clone ${HINDSIGHT_URL}
+    echo -e "${YELLOW}[*] Téléchargement de hindsight...${NC}"
+    echo -e "${GREEN} [+] hindisght a été mis en place ${NC} !"
+    cd ../
+fi
+
+
 
 echo -e "${GREEN}[+] Installation terminée. ${NC}"
 
