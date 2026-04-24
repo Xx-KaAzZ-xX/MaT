@@ -133,7 +133,7 @@ fi
 if [ ! -f "./firefox_decrypt.py" ]; then
     echo -e "${YELLOW} firefox_decrypt.py est manquant dans le dossier courant ${NC}" >&2
     echo -e "${YELLOW}[*] Téléchargement de l'outil ${NC}"
-    wget "${FIREFOX_DECRYPT_URL}" -O firefox_decrypt.py
+    wget "${FIREFOX_DECRYPT_URL}" -O "${PWD}/firefox_decrypt.py"
     
 fi
 
