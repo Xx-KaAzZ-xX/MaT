@@ -1153,12 +1153,14 @@ def get_browsing_data(computer_name, mount_path):
             # ---- Firefox ----
             if "logins.json" in files:
                 firefox_login_path = os.path.join(root, "logins.json")
+                print(root)
+                print(firefox_login_path)
                 temp_file = f"/tmp/logins_firefox_{hash(firefox_login_path)}.json"
                 try:
                     print(yellow("[!] Trying to decrypt Firefox credentials"))
                     # trouver le dossier racine "firefox"
                     firefox_root = firefox_login_path.split("firefox")[0] + "firefox"
-                    #print(firefox_root)
+                    print(firefox_root)
                     decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
                     if os.path.exists(decrypt_script):
                         try:
@@ -2787,12 +2789,12 @@ def get_windows_browsing_data(mount_path, computer_name):
                 try:
                     for profile in os.listdir(firefox_login_path):
                         login_db_path = os.path.join(firefox_login_path, profile, 'logins.json')
-                        #firefox_root = firefox_login_path.split("Profiles")[0]
+                        firefox_root = firefox_login_path.split("Profiles")[0]
                         temp_file = f"/tmp/logins_firefox_{hash(login_db_path)}.json"
                         try:
                             print(yellow("[!] Trying to decrypt Firefox credentials"))
                             # trouver le dossier racine "firefox"
-                            print(firefox_root)
+                            #print(firefox_root)
                             decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
 
                             try:
@@ -3032,6 +3034,9 @@ def analyze_yara(computer_name, file_path, rule):
         if not os.path.exists(yara_rule):
             print(f"Yara rule {yara_rule} doesn't exist. Script will exit.")
             sys.exit(1)
+    else:
+        print(red("Yara is not installed on your system. Script will exit"))
+        sys.exit(1)
 
     yara_cmd = f"yara -w -s -r {yara_rule}"
     launch_yara_cmd = f"{yara_cmd} {file_path}"
@@ -3830,29 +3835,10 @@ def get_instant_messaging(computer_name, mount_path):
 
             # ---- Telegram Desktop ----
             if "tdata" in dirs:
-                try:
-                    from opentele.td import TDesktop
-                    tdata_path = os.path.join(root, "tdata")
-                    try:
-                        tdesk = TDesktop(tdata_path)
-                    except BaseException as tdesktop_error:
-                        print(red(f"[!] Impossible de charger {tdata_path} : {tdesktop_error}"))
-                        writer.writerow({
-                            'computer_name': computer_name,
-                            'im_app': 'Telegram Desktop',
-                            'im_account': '',
-                            'im_password': '',
-                            'file_path': tdata_path
-                        })
-                        counter += 1
-                        continue
-                    if not tdesk.isLoaded():
-                        print(f"[!] Impossible de charger {tdata_path}")
-                    else:
-                        for account in tdesk.accounts:
-                            print(f"Telegram account ID : {account.UserId}")
-                            print(account.MainDcId)
-                            print(f"Datacenter ID      : {account.MainDcId}")
+                opentele_venv = "/root/SCRIPTS/OpenTele/bin/python"
+                if not os.path.exists(opentele_venv):
+                    print(red(f"[!] OpenTele virtual env not found ! Fix this if you want to retrieve data from tdata directory."))
+
                     writer.writerow({
                         'computer_name': computer_name,
                         'im_app': 'Telegram Desktop',
@@ -3861,8 +3847,65 @@ def get_instant_messaging(computer_name, mount_path):
                         'file_path': tdata_path
                     })
                     counter += 1
+                    continue
+                try:
+                    tdata_path = os.path.join(root, "tdata")
+                    code=f"""
+from opentele.td import TDesktop
+tdata_path = r\"{tdata_path}\"
+try:
+    tdesk = TDesktop(tdata_path)
+    if not tdesk.isLoaded():
+        print(f"[!] Impossible de charger {{tdata_path}}")
+    else:
+        for account in tdesk.accounts:
+            print(f"Telegram account ID: {{account.UserId}}")
+            print(f"Datacenter ID: {{account.MainDcId}}")
+except BaseException as tdesktop_error:
+    print(f"[!] Error loading {{tdata_path}} : {{tdesktop_error}}")
+"""
+
+                    result = subprocess.run(
+                        [opentele_venv, "-c", code],
+                        capture_output=True,
+                        text=True
+                    )
+
+                        # Analyse la sortie pour extraire les informations
+                    #print(result)
+                    stdout = result.stdout.strip()
+                    stderr = result.stderr.strip()
+
+                    # Si stderr n'est pas vide, on enregistre l'erreur
+                    if stderr:
+                        error = stderr
+                    # Sinon, on analyse stdout
+                    elif stdout:
+                        #print(stdout)
+                        for line in stdout.split('\n'):
+                            line = line.strip()
+                            if line.startswith("Telegram account ID:"):
+                                tg_user_id = line.split(":")[-1].strip()
+                    writer.writerow({
+                        'computer_name': computer_name,
+                        'im_app': 'Telegram Desktop',
+                        'im_account': tg_user_id,
+                        'im_password': '',
+                        'file_path': tdata_path
+                    })
+                    counter += 1
+
+
                 except Exception as e:
                     print(red(f"Error retrieving Telegram information : {e}"))
+                    writer.writerow({
+                        'computer_name': computer_name,
+                        'im_app': 'Telegram Desktop',
+                        'im_account': '',
+                        'im_password': '',
+                        'file_path': tdata_path
+                    })
+                    counter += 1
             # ---- Discord ----
             if "Discord" in dirs:
                 try:
@@ -4178,7 +4221,7 @@ if image_path:
     partitions = []
     found = False
     for line in lines:
-        if line.startswith("Device"):
+        if line.startswith("Device") or line.startswith("Périphérique"):
             found = True
             continue
         if found and line.strip():
