@@ -2897,6 +2897,99 @@ def get_windows_browsing_data(mount_path, computer_name):
         print(yellow(f"Browsing data {output_file} should be empty"))
 
 
+def get_windows_browsing_hindsight(computer_name, mount_path):
+    print(green(f"[+] Browsing artifacts (Hindsight)"))
+    print(yellow(f"[!] Retrieving browser history..."))
+
+    users_dir = os.path.join(mount_path, "Users")
+
+    # Navigateurs + chemins relatifs
+    browsers = {
+        "chrome": "AppData/Local/Google/Chrome",
+        "edge": "AppData/Local/Microsoft/Edge",
+        "opera": "AppData/Local/Opera Software",
+        "firefox": "AppData/Roaming/Mozilla/Firefox"
+        # Safari non pertinent sur Windows
+    }
+
+    hindsight_script = "hindsight/hindsight.py"
+
+    if not os.path.exists(users_dir):
+        print(yellow(f"[!] {users_dir} not found"))
+        return
+
+    for user in os.listdir(users_dir):
+        user_path = os.path.join(users_dir, user)
+
+        if not os.path.isdir(user_path):
+            continue
+
+        for browser, rel_path in browsers.items():
+            browser_path = os.path.join(user_path, rel_path)
+
+            if os.path.exists(browser_path):
+                output_name = script_path + "/" + result_folder + "/" + f"hindsight_{browser}"
+
+                cmd = [
+                    "python3",
+                    hindsight_script,
+                    "-i", browser_path,
+                    "-f", "jsonl",
+                    "-o", output_name
+                ]
+
+                print(f"[+] Running Hindsight for {browser} ({user})")
+
+                try:
+                    subprocess.run(cmd, capture_output=True, text=True)
+                    # --- parsing du JSONL généré ---
+                    jsonl_file = f"{output_name}.jsonl"
+                    output_csv = os.path.join(script_path, result_folder, "windows_browser_indexeddb.csv")
+                    csv_columns = ['computer_name', 'type', 'source', 'origin', 'key', 'value', 'indexeddb_database', 'date']
+    
+                    if os.path.exists(jsonl_file):
+                        with open(output_csv, mode='a', newline='', encoding='utf-8') as f_out:
+                            writer = csv.DictWriter(f_out, fieldnames=csv_columns)
+                            writer.writeheader()
+
+                            with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f_in:
+                                for line in f_in:
+                                    try:
+                                        data = json.loads(line)
+
+                                        if data.get("source_long") != "Chrome IndexedDB":
+                                            continue
+
+                                        # extraction timestamp depuis message
+                                        message = data.get("message", "")
+                                        timestamp = ""
+                                        match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', message)
+                                        if match:
+                                            try:
+                                                dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+                                                timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+                                            except:
+                                                pass
+
+                                        writer.writerow({
+                                            'computer_name': computer_name,
+                                            'type': data.get("source_long", ""),
+                                            'source': data.get("profile", ""),
+                                            'origin': data.get("origin", ""),
+                                            'key': data.get("key", ""),
+                                            'value': data.get("value", ""),
+                                            'indexeddb_database': data.get("database", ""),
+                                            'date': timestamp
+                                        })
+
+                                    except Exception as error:
+                                        print(yellow(f"[!] Error during parsing : {error}"))
+                                        continue
+                except Exception as e:
+                    print(red(f"[-] Error running Hindsight for {browser}: {e}"))
+
+    print(green("[+] Hindsight extraction finished"))
+
 def hayabusa_evtx(mount_path, computer_name):
     hayabusa_path = script_path + "/hayabusa/hayabusa"
     run_hayabusa = input("Do you want to launch Hayabusa? (yes/no): ").strip().lower()
@@ -4296,7 +4389,7 @@ if len(sys.argv) > 1:
             list_services(mount_path, computer_name)
             get_command_history(mount_path, computer_name)
             get_firewall_rules(mount_path, computer_name)
-            #get_linux_used_space(mount_path, computer_name)
+            get_linux_used_space(mount_path, computer_name)
             get_linux_docker(mount_path, computer_name)
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)
@@ -4322,6 +4415,7 @@ if len(sys.argv) > 1:
             get_windows_full_registry(mount_path, computer_name)
             get_windows_browsing_history(mount_path, computer_name)
             get_windows_browsing_data(mount_path, computer_name)
+            get_windows_browsing_hindsight(computer_name, mount_path)
             hayabusa_evtx(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
