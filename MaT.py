@@ -708,57 +708,87 @@ def list_installed_apps(mount_path, computer_name):
 def get_nginx_info(computer_name, mount_path):
     print(green(f"[+] Nginx webserver detected"))
     print(yellow(f"[!]Retrieving Nginx information..."))
-    nginx_dir = os.path.join(mount_path, "etc/nginx") 
 
+    nginx_dir = os.path.join(mount_path, "etc/nginx") 
     output_file = os.path.join(script_path, result_folder, "linux_websites.csv")
-    csv_columns = ['computer_name', 'website_name', 'website_root', 'listening_port', 'webserver']
-    
+
+    csv_columns = ['computer_name', 'website_name', 'website_root', 'listening_port', 'webserver', 'source_file']
+
     try:
         with open(output_file, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=csv_columns)
             writer.writeheader()
-            website_enabled_dir = os.path.join(nginx_dir, "sites-enabled") 
-            if os.path.exists(website_enabled_dir):
-                vhost_files = os.listdir(website_enabled_dir)
-                for vhost_file in vhost_files:
-                    #print(vhost_file)
-                    vhost_path = os.path.join(website_enabled_dir, vhost_file)
-                    # Résoudre le lien symbolique
+
+            # --- sites-enabled ---
+            sites_enabled_dir = os.path.join(nginx_dir, "sites-enabled")
+            if os.path.exists(sites_enabled_dir):
+                for vhost_file in os.listdir(sites_enabled_dir):
+                    vhost_path = os.path.join(sites_enabled_dir, vhost_file)
+
                     if os.path.islink(vhost_path):
                         real_path = os.readlink(vhost_path)
-                        #real_path2 = os.path.join(mount_path, real_path)
-                        #real_path2 = os.path.join(os.path.dirname(mount_path), real_path)
-                        real_path2 = os.path.join(mount_path, real_path.lstrip("/"))
+                        real_path = os.path.join(mount_path, real_path.lstrip("/"))
                     else:
-                        real_path2 = vhost_path
+                        real_path = vhost_path
+
                     try:
-                        with open(real_path2, 'r', encoding='utf-8', errors='ignore') as vhost:
+                        with open(real_path, 'r', encoding='utf-8', errors='ignore') as vhost:
                             content = vhost.read()
-                            # Récupère le nom du site (server_name) et port d'écoute (listen)
+
                             server_name_match = re.search(r'^\s*server_name\s+([^;]+);', content, re.MULTILINE)
                             root_match = re.search(r'^\s*root\s+([^;]+);', content, re.MULTILINE)
                             listen_match = re.search(r'^\s*listen\s+(\d+)', content, re.MULTILINE)
 
-                            website_name = server_name_match.group(1).strip() if server_name_match else 'unknown'
-                            listening_port = listen_match.group(1).strip() if listen_match else '80'  # défaut 80
-                            website_root = root_match.group(1).strip() if root_match else 'unknown'
+                            if not (server_name_match or root_match):
+                                continue
 
                             writer.writerow({
                                 'computer_name': computer_name,
-                                'website_name': website_name,
-                                'website_root': website_root,
-                                'listening_port': listening_port,
-                                'webserver': 'nginx'
+                                'website_name': server_name_match.group(1).strip() if server_name_match else 'unknown',
+                                'website_root': root_match.group(1).strip() if root_match else 'unknown',
+                                'listening_port': listen_match.group(1).strip() if listen_match else '80',
+                                'webserver': 'nginx',
+                                'source_file': real_path
                             })
+
                     except Exception as e:
                         print(red(f"[-] Failed to parse {vhost_file}: {e}"))
 
+            # --- conf.d ---
+            conf_d_dir = os.path.join(nginx_dir, "conf.d")
+            if os.path.exists(conf_d_dir):
+                for conf_file in os.listdir(conf_d_dir):
+                    conf_path = os.path.join(conf_d_dir, conf_file)
 
-            else:
-                print(yellow(f"[!] {website_enabled_dir} doesn't exist"))
+                    if not os.path.isfile(conf_path):
+                        continue
+
+                    try:
+                        with open(conf_path, 'r', encoding='utf-8', errors='ignore') as conf:
+                            content = conf.read()
+
+                            server_name_match = re.search(r'^\s*server_name\s+([^;]+);', content, re.MULTILINE)
+                            root_match = re.search(r'^\s*root\s+([^;]+);', content, re.MULTILINE)
+                            listen_match = re.search(r'^\s*listen\s+(\d+)', content, re.MULTILINE)
+
+                            if not (server_name_match or root_match):
+                                continue
+
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'website_name': server_name_match.group(1).strip() if server_name_match else 'unknown',
+                                'website_root': root_match.group(1).strip() if root_match else 'unknown',
+                                'listening_port': listen_match.group(1).strip() if listen_match else '80',
+                                'webserver': 'nginx',
+                                'source_file': conf_path
+                            })
+
+                    except Exception as e:
+                        print(red(f"[-] Failed to parse {conf_file}: {e}"))
+
     except Exception as e:
         print(red(f"[-] Error retrieving Nginx information: {e}"))
-    
+
     print(green(f"[+] Nginx information have been written into {output_file}"))
 
 def get_apache_info(computer_name, mount_path):
@@ -2634,7 +2664,8 @@ def convert_chrome_time(chrome_timestamp):
 
 def convert_firefox_time(firefox_timestamp):
     """ Convert Unix timestamp in microseconds to human-readable date. """
-    return datetime.utcfromtimestamp(firefox_timestamp / 1000000)
+    #return datetime.utcfromtimestamp(firefox_timestamp / 1000000)
+    return datetime.fromtimestamp(firefox_timestamp / 1000000, UTC)
 
 def get_windows_browsing_history(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "windows_browsing_history.csv"
@@ -2966,6 +2997,7 @@ def get_windows_browsing_hindsight(computer_name, mount_path):
                                         match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', message)
                                         if match:
                                             try:
+                                                print(match)
                                                 dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
                                                 timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
                                             except:
