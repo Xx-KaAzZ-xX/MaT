@@ -144,6 +144,8 @@ fi
 
 if [ ! -d "${CUR_DIR}/hindsight" ]; then
     echo -e "${YELLOW} hindsight est manquant dans le dossier courant ${NC}" >&2
+    mkdir -p "${CUR_DIR}/hindsight"
+    cd ${CUR_DIR}/
     git clone ${HINDSIGHT_URL}
     echo -e "${YELLOW}[*] Téléchargement de hindsight...${NC}"
     echo -e "${GREEN} [+] hindisght a été mis en place ${NC} !"
