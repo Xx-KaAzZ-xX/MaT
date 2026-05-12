@@ -104,7 +104,7 @@ def get_windows_timestamp(win_timestamp):
 
 def get_system_info(mount_path):
     output_file = os.path.join(script_path, result_folder, "linux_system_info.csv")
-    print(yellow(f"[+] Retrieving System information ..."))
+    print(yellow(f"[!] Retrieving System information ..."))
     try:
         # Initialisation des valeurs par défaut
         last_update = ''
@@ -872,19 +872,86 @@ def get_apache_info(computer_name, mount_path):
 def list_services(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_services.csv")
     init_path = os.path.join(mount_path, "usr/sbin/init")
-    print(yellow("[+] Retrieving Services informations..."))
+    print(yellow("[!] Retrieving Services informations..."))
     counter = 0
     if os.path.exists(init_path):
-        init_sys = os.path.basename(os.readlink(init_path))
+        try:
+            init_sys = os.path.basename(os.readlink(init_path))
+        except:
+            init_sys = os.path.basename(init_path)
 
         if init_sys == "systemd":
             chroot_command = "systemctl list-unit-files --type=service"
             stdout, stderr = chroot_and_run_command(mount_path, chroot_command)
 
-            if stderr:
-                print(red(f"[-] Erreur: {stderr}"))
-                return
+            if stderr or not stdout:
+                print(yellow("[!] systemctl failed, using filesystem fallback"))
 
+                services = []
+
+                wants_dirs = [
+                    os.path.join(mount_path, "etc/systemd/system/multi-user.target.wants"),
+                    os.path.join(mount_path, "etc/systemd/system"),
+                    os.path.join(mount_path, "usr/lib/systemd/system"),
+                    os.path.join(mount_path, "lib/systemd/system"),
+                ]
+
+                seen = set()
+
+                for wants_dir in wants_dirs:
+                    if not os.path.exists(wants_dir):
+                        continue
+
+                    for root, dirs, files in os.walk(wants_dir):
+                        for file in files:
+                            if not file.endswith(".service"):
+                                continue
+
+                            if file in seen:
+                                continue
+
+                            seen.add(file)
+
+                            service_name = file
+                            status = "enabled"
+
+                            service_path = os.path.join(root, file)
+
+                            # Détection enabled/disabled
+                            if ".wants" not in root:
+                                status = "available"
+
+                            services.append((
+                                computer_name,
+                                service_name,
+                                status,
+                                status
+                            ))
+
+                            counter += 1
+
+                            if "nginx" in service_name:
+                                get_nginx_info(computer_name, mount_path)
+
+                            if "apache2" in service_name or "httpd" in service_name:
+                                get_apache_info(computer_name, mount_path)
+
+                with open(output_file, mode='w', newline='') as csvfile:
+                    csv_writer = csv.writer(csvfile)
+                    csv_writer.writerow([
+                        'computer_name',
+                        'service_name',
+                        'status',
+                        'status_at_boot'
+                    ])
+                    csv_writer.writerows(services)
+
+                if counter >= 1:
+                    print(green(f"Services informations has been written into {output_file}."))
+                else:
+                    print(yellow(f"{output_file} must be empty."))
+
+                return
             # Traitement de la sortie
             services = []
             for line in stdout.splitlines()[1:]:  # Ignorer l'en-tête
@@ -929,7 +996,7 @@ def list_services(mount_path, computer_name):
 
 def get_command_history(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_command_history.csv")
-    print(yellow("[+] Retrieving command history ..."))
+    print(yellow("[!] Retrieving command history ..."))
     csv_columns = ['computer_name', 'user', 'shell', 'command']
     
     try:
@@ -1374,7 +1441,7 @@ def get_linux_browsing_history(mount_path, computer_name):
 def get_linux_browsing_data(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_browsing_data.csv"
     csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
-    print(yellow("[+] Retrieving browsing data (saved logins)"))
+    print(yellow("[!] Retrieving browsing data (saved logins)"))
 
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=csv_columns)
@@ -1550,7 +1617,7 @@ def get_linux_crontab(mount_path, computer_name):
     script_path = os.path.dirname(os.path.realpath(__file__))
     output_file = script_path + "/" + result_folder + "/" + "linux_crontab.csv"
     csv_columns = ['computer_name', 'user', 'scheduled', 'task', 'source_file']
-    print(yellow("[+] Retrieving crontab ..."))
+    print(yellow("[!] Retrieving crontab ..."))
     tasks = []
     
     try:
@@ -1649,7 +1716,7 @@ def get_linux_crontab(mount_path, computer_name):
 def get_linux_used_space(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_disk_usage.csv")
     csv_columns = ['computer_name', 'directory', 'percent_used']
-    print(yellow("[+] Retrieving disk usage ..."))
+    print(yellow("[!] Retrieving disk usage ..."))
     
     try:
         # Taille totale de la partition racine (en octets)
@@ -1683,8 +1750,8 @@ def get_linux_used_space(mount_path, computer_name):
 
 def get_linux_docker(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_docker.csv")
-    csv_columns = ['computer_name', 'container_name', 'exposed_ports', 'volumes', 'container_logs', 'overlay_directory']
-    print(yellow("[+] Retrieving docker containers information..."))
+    csv_columns = ['computer_name', 'container_name', 'container_state', 'container_ip', 'exposed_ports', 'volumes', 'container_logs', 'overlay_directory']
+    print(yellow("[!] Retrieving docker containers information..."))
     docker_containers_dir = os.path.join(mount_path, "var/lib/docker/containers")
     overlay_dir = os.path.join(mount_path, "var/lib/docker/overlay2")
   
@@ -1708,6 +1775,14 @@ def get_linux_docker(mount_path, computer_name):
                         data = json.load(f)
 
                     container_name = data.get("Name", "").lstrip("/")
+                    container_state = data.get("State", {}).get("Running", "")
+                    container_ip = ""
+                    networks = data.get("NetworkSettings", {}).get("Networks", {})
+                    for net_data in networks.values():
+                        ip = net_data.get("IPAddress")
+                        if ip:
+                            container_ip = ip
+                            break
                     container_ports = ",".join(data.get("Config", {}).get("ExposedPorts", {}).keys()) if data.get("Config", {}).get("ExposedPorts") else ""
                     container_logs = data.get("LogPath", {}) if data.get("LogPath") else ""
                     if container_logs:
@@ -1728,10 +1803,11 @@ def get_linux_docker(mount_path, computer_name):
                     else:
                         overlay_directory = "Unknown"
 
-
                     writer.writerow({
                         "computer_name": computer_name,
                         "container_name": container_name,
+                        "container_state": container_state,
+                        "container_ip": container_ip,
                         "exposed_ports": container_ports,
                         "volumes": volumes,
                         "container_logs": container_logs,
@@ -1755,9 +1831,15 @@ def get_linux_docker(mount_path, computer_name):
 def get_windows_machine_name(mount_path):
     #chaine = "Informations du système Windows"
     #print (bandeau(chaine))
-    user_input = input("Do you want to set computer name ? (y/N) ").strip().lower()
+    if automate:
+        user_input = 'n'
+    else:
+        user_input = input("Do you want to set computer name ? (y/N) ").strip().lower()
     if user_input == 'y':
-        computer_name = input("Veuillez entrer le nom de la machine: ").strip()
+        if automate:
+            computer_name = ''
+        else:
+            computer_name = input("Veuillez entrer le nom de la machine: ").strip()
         return computer_name
     else:
         path_to_reg_hive = (mount_path+ 'Windows/System32/config/SYSTEM')
@@ -1872,7 +1954,7 @@ def get_windows_info(mount_path, computer_name):
         'proxy_enabled': '',
         'timezone': ''
     }
-    print(yellow(f"[+] Retrieving system information..."))
+    print(yellow(f"[!] Retrieving system information..."))
     # Récupération des informations NTP (dans le registre SYSTEM)
     path_to_reg_hive = os.path.join(mount_path, 'Windows/System32/config/SYSTEM')
     try:
@@ -2031,7 +2113,7 @@ def get_windows_network_info(mount_path, computer_name):
     path_to_reg_hive = os.path.join(mount_path, 'Windows/System32/config/SYSTEM')
     reg = Registry.Registry(path_to_reg_hive)
     output_file = script_path + "/" + result_folder + "/" + "windows_network_info.csv"
-    print(yellow("[+] Retrieving network information"))
+    print(yellow("[!] Retrieving network information"))
     # Initialisation des données
     network_info = []
     counter = 0
@@ -2084,7 +2166,7 @@ def get_startup_services(mount_path, computer_name):
     # Registry path for services
     services_path = "ControlSet001\\Services"
     output_file = os.path.join(script_path, result_folder, "windows_services.csv")
-    print(yellow("[+] Retrieving Windows Services information..."))
+    print(yellow("[!] Retrieving Windows Services information..."))
 
     # Load the SYSTEM hive
     try:
@@ -2133,7 +2215,7 @@ def get_startup_services(mount_path, computer_name):
 
 
 def get_windows_users(mount_path, computer_name):
-    print(yellow("[+] Retrieving Windows Users informations..."))
+    print(yellow("[!] Retrieving Windows Users informations..."))
     try:
         sam_file = os.path.join(mount_path, 'Windows/System32/config/SAM')
         regripper_path = "/usr/bin/regripper"
@@ -2190,7 +2272,7 @@ def get_windows_users(mount_path, computer_name):
 
 
 def get_windows_groups(mount_path, computer_name):
-    print(yellow("[+] Retrieving Windows Groups informations..."))
+    print(yellow("[!] Retrieving Windows Groups informations..."))
     try:
         sam_file = os.path.join(mount_path, 'Windows/System32/config/SAM')
         regripper_path = "/usr/bin/regripper"
@@ -2255,7 +2337,7 @@ def get_windows_firewall_rules(mount_path, computer_name):
         "ControlSet001\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules",
         "CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules"
     ]
-    print(yellow("[+] Retrieving Firewall rules..."))
+    print(yellow("[!] Retrieving Firewall rules..."))
     output_file = os.path.join(script_path, result_folder, "windows_firewall_rules.csv")
 
     csv_columns = ['computer_name', 'action', 'active', 'direction', 'protocol', 'profile', 'srcport', 'dstport', 'app', 'svc', 'rule_name', 'desc', 'embedctxt']
@@ -2329,7 +2411,7 @@ def get_windows_installed_roles(mount_path, computer_name):
     #print(f"Role/Feature: {subkey.name()}")
     path_to_reg_hive = os.path.join(mount_path, 'Windows/System32/config/SOFTWARE')
     reg = Registry.Registry(path_to_reg_hive)
-    print(yellow("[+] Retrieving Windows Roles informations..."))
+    print(yellow("[!] Retrieving Windows Roles informations..."))
 
     # Définir le chemin de la clé de registre pour les rôles et fonctionnalités installés
     key_path = 'Microsoft\\ServerManager\\ServicingStorage\\ServerComponentCache'
@@ -2369,7 +2451,7 @@ def get_windows_installed_programs(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "windows_installed_programs.csv"
     software_file = os.path.join(mount_path, 'Windows/System32/config/SOFTWARE')
     csv_columns = ['computer_name', 'program_name', 'program_version', 'install_date']
-    print(yellow("[+] Retrieving installed programs"))
+    print(yellow("[!] Retrieving installed programs"))
 
     regripper_path = "/usr/bin/regripper"  # Chemin vers regripper
     try:
@@ -2431,7 +2513,7 @@ def get_windows_installed_programs(mount_path, computer_name):
 def get_windows_executed_programs(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "windows_executed_programs.csv")
     csv_columns = ['computer_name', 'filepath', 'executed_date']
-    print(yellow("[+] Retrieving executed programs"))
+    print(yellow("[!] Retrieving executed programs"))
 
     possible_amcache_path = [
         "Windows/AppCompat/Programs/Amcache.hve",
@@ -2510,7 +2592,7 @@ def get_windows_scheduled_tasks(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "windows_scheduled_tasks.csv")
     csv_columns = ['computer_name', 'task_name', 'date', 'action', 'user', 'schedule', 'command']
 
-    print(yellow("[+] Retrieving scheduled tasks from Tasks directory"))
+    print(yellow("[!] Retrieving scheduled tasks from Tasks directory"))
     tasks = []
     target_tags = ["Date", "Author", "Triggers", "Enabled", "UserId", "Actions", "Exec", "Command"]
     counter = 0
@@ -2595,7 +2677,11 @@ def serialize_entry(entry, computer_name, hive_name):
     }
 
 def get_windows_full_registry(mount_path, computer_name):
-    user_input = input("Do you want to dump the full registry KEYS ? It could be very long. (y/N) ").strip().lower()
+    if automate:
+        user_input = 'y'
+        print(yellow("[!] --automate: dumping full registry keys."))
+    else:
+        user_input = input("Do you want to dump the full registry KEYS ? It could be very long. (y/N) ").strip().lower()
     if user_input == 'y':
         output_dir = script_path + "/" + result_folder + "/"
         try:
@@ -2670,7 +2756,7 @@ def convert_firefox_time(firefox_timestamp):
 def get_windows_browsing_history(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "windows_browsing_history.csv"
     csv_columns = ['computer_name', 'source', 'user', 'url_title', 'link', 'search_date']
-    print(yellow("[+] Retrieving browsing history"))
+    print(yellow("[!] Retrieving browsing history"))
     temp_file = "/tmp/temp_history.sqlite"
 
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
@@ -2760,7 +2846,7 @@ def get_windows_browsing_history(mount_path, computer_name):
 def get_windows_browsing_data(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "windows_browsing_data.csv"
     csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
-    print(yellow("[+] Retrieving browsing data (saved logins)"))
+    print(yellow("[!] Retrieving browsing data (saved logins)"))
     
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=csv_columns)
@@ -3024,7 +3110,11 @@ def get_windows_browsing_hindsight(computer_name, mount_path):
 
 def hayabusa_evtx(mount_path, computer_name):
     hayabusa_path = script_path + "/hayabusa/hayabusa"
-    run_hayabusa = input("Do you want to launch Hayabusa? (yes/no): ").strip().lower()
+    if automate:
+        run_hayabusa = "yes"
+        print(yellow("[!] --automate: launching Hayabusa."))
+    else:
+        run_hayabusa = input("Do you want to launch Hayabusa? (yes/no): ").strip().lower()
 
     if run_hayabusa == "yes":
         # Demander le nom du fichier de sortie
@@ -3345,7 +3435,11 @@ def find_files_chunk(mount_path, file_pattern):
 
 
 def get_files_of_interest(mount_path, computer_name, threads_number, platform):
-    run_find_crypto = input("Do you want to launch some files of interest & crypto stuff research? It will be quite long? (yes/no): ").strip().lower()
+    if automate:
+        run_find_crypto = "yes"
+        print(yellow("[!] --automate: launching files of interest & crypto research."))
+    else:
+        run_find_crypto = input("Do you want to launch some files of interest & crypto stuff research? It will be quite long? (yes/no): ").strip().lower()
     if run_find_crypto != "yes":
         return
     if platform == "Linux":
@@ -3547,7 +3641,7 @@ def find_potential_db_leaks(computer_name, mount_path):
 
 
     if counter > 1:
-        print(green(f"{counter} rows added to {output_csv}"))
+        print(green(f"[+] {counter} rows added to {output_csv}"))
     else:
         print(yellow("[-] No DB Leaks found."))
 
@@ -3718,8 +3812,8 @@ def process_crypto_chunk(chunk, computer_name, files_to_search, bip39_words, csv
             if os.path.getsize(file_path) > max_file_size:
                 local_pbar.update(1)
                 continue
-            with open("process_crypto_log.txt", "a") as log_file:
-                log_file.write(f"Starting analysis of {file_path}\n")
+            #with open("process_crypto_log.txt", "a") as log_file:
+            #    log_file.write(f"Starting analysis of {file_path}\n")
 
             # Check if the file matches one of the wallet names
             if file_name in files_to_search:
@@ -4252,6 +4346,129 @@ def get_mft(computer_name, image_path, byte_offset):
     except Exception as e:
         print(red(f"[-] Error extracting or parsing MFT: {e}"))
 
+def auto_select_partition(partitions, real_image):
+    """
+    Hybrid auto-selection of the OS partition:
+    1. Exclude EFI, swap, extended, BIOS boot partitions by type ID
+    2. Exclude partitions smaller than 2 GiB (boot, recovery)
+    3. Warn on LVM (requires manual vgscan/vgchange)
+    4. Probe remaining candidates by temporarily mounting them read-only
+       and checking for Linux/Windows OS indicators
+    5. Fall back to the largest candidate if no indicators found
+    Returns the 1-based partition number, or None on failure.
+    """
+    SKIP_TYPE_IDS = {'5', 'f', 'ee', 'ef', '82', 'ab', 'de', 'fb', 'fc'}
+    SKIP_KEYWORDS = ['extended', 'efi system', 'bios boot', 'swap', 'linux swap',
+                     'étendu', 'système efi', 'amorçage bios', 'hidden',
+                     'windows re', 'hibernation', 'recovery']
+    LVM_TYPE_IDS  = {'8e', 'fd'}
+
+    LINUX_INDICATORS   = ['etc/os-release', 'etc/passwd', 'bin/bash']
+    WINDOWS_INDICATORS = ['Windows/System32', 'Windows/system32', 'Users']
+
+    MIN_SECTORS = 4 * 1024 * 1024  # 2 GiB in 512-byte sectors
+
+    candidates   = []
+    lvm_detected = []
+
+    for i, line in enumerate(partitions, 1):
+        cols = line.split()
+        if not cols:
+            continue
+
+        bootable = '*' in cols
+        s = 2 if bootable else 1  # index of Start sector column
+
+        try:
+            sectors = int(cols[s + 2])
+        except (IndexError, ValueError):
+            sectors = 0
+
+        type_id   = cols[s + 4].lower() if len(cols) > s + 4 else ''
+        type_desc = ' '.join(cols[s + 5:]).lower() if len(cols) > s + 5 else ''
+
+        if type_id in LVM_TYPE_IDS:
+            lvm_detected.append((i, line.strip()))
+            continue
+
+        if type_id in SKIP_TYPE_IDS:
+            continue
+        if any(k in type_desc for k in SKIP_KEYWORDS):
+            continue
+        if sectors < MIN_SECTORS:
+            continue
+
+        candidates.append((i, sectors, line.strip()))
+
+    if lvm_detected:
+        print(yellow("[!] LVM partition(s) detected — requires manual vgscan/vgchange before mounting:"))
+        for num, l in lvm_detected:
+            print(f"    Partition {num}: {l}")
+
+    if not candidates:
+        print(red("[-] No valid OS partition candidates found after filtering."))
+        return None
+
+    # Probe from largest to smallest
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    print(yellow(f"[!] Probing {len(candidates)} candidate(s) for OS indicators..."))
+
+    for i, sectors, line_str in candidates:
+        cols     = line_str.split()
+        bootable = '*' in cols
+        s        = 2 if bootable else 1
+        try:
+            start_sector = int(cols[s])
+        except (IndexError, ValueError):
+            continue
+
+        byte_offset = start_sector * 512
+        probe_dir   = f"/tmp/mat_probe_{i}"
+        os.makedirs(probe_dir, exist_ok=True)
+
+        mounted   = False
+        found_os  = None
+        try:
+            # First try with norecovery (ext4); fall back without (NTFS)
+            for mount_opts in [f"ro,norecovery,offset={byte_offset}",
+                               f"ro,offset={byte_offset}"]:
+                r = subprocess.run(
+                    ["mount", "-o", mount_opts, real_image, probe_dir],
+                    capture_output=True, text=True, timeout=10
+                )
+                if r.returncode == 0:
+                    mounted = True
+                    break
+
+            if mounted:
+                for indicator in LINUX_INDICATORS:
+                    if os.path.exists(os.path.join(probe_dir, indicator)):
+                        found_os = "Linux"
+                        break
+                if not found_os:
+                    for indicator in WINDOWS_INDICATORS:
+                        if os.path.exists(os.path.join(probe_dir, indicator)):
+                            found_os = "Windows"
+                            break
+        except Exception:
+            pass
+        finally:
+            subprocess.run(["umount", probe_dir], capture_output=True)
+            try:
+                os.rmdir(probe_dir)
+            except Exception:
+                pass
+
+        if found_os:
+            print(green(f"[+] Partition {i} → {found_os} OS detected: {line_str}"))
+            return i
+
+    # Fallback: largest surviving candidate
+    best_i, _, best_line = candidates[0]
+    print(yellow(f"[!] No OS indicators found via probe. Falling back to largest partition ({best_i}): {best_line}"))
+    return best_i
+
+
 parser = argparse.ArgumentParser(
     description="""Mount and Triage. Python Forensic Script
 
@@ -4264,11 +4481,71 @@ Exemple :
 parser.add_argument("-f", "--image", required=False, help="Path to disk image (.raw, .img, .qcow2, .E01)")
 parser.add_argument("-d", "--mount", required=True, help="Mount directory")
 parser.add_argument("-t", "--threads", required=False, type=int, default=4, help="Number of threads")
+parser.add_argument("--automate", action="store_true",
+                    help="Non-interactive mode: auto-select the OS partition and run full triage without prompts")
+parser.add_argument("--image-directory", dest="image_directory", required=False, metavar="DIR",
+                    help="Directory containing disk images. Triage all images found (.E01, .raw, .img, .qcow2, .001).\n"
+                         "-d becomes the base directory; mount points are created as <-d>/<image_stem>/.\n"
+                         "Implies --automate. Mutually exclusive with -f/--image.")
 args = parser.parse_args()
 
 image_path = args.image
 mount_path = args.mount
 threads_number = args.threads
+automate = args.automate
+
+if args.image_directory:
+    img_dir = Path(args.image_directory)
+    if not img_dir.is_dir():
+        print(red(f"[-] --image-directory: '{img_dir}' is not a valid directory."))
+        sys.exit(1)
+    if image_path:
+        print(red("[-] --image-directory and -f/--image are mutually exclusive."))
+        sys.exit(1)
+
+    # Only pick the first file of a series (.E01, .001) — not .E02/.002 etc.
+    BATCH_EXTS = {'.e01', '.raw', '.img', '.qcow2', '.001'}
+    images = sorted([
+        f for f in img_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in BATCH_EXTS
+    ])
+
+    if not images:
+        print(red(f"[-] No image files ({', '.join(BATCH_EXTS)}) found in '{img_dir}'."))
+        sys.exit(1)
+
+    print(green(f"[+] {len(images)} image(s) found in '{img_dir}':"))
+    for img in images:
+        print(f"    {img.name}")
+
+    base_mount = Path(mount_path)
+    errors = []
+
+    for img in images:
+        mount_point = base_mount / img.stem
+        mount_point.mkdir(parents=True, exist_ok=True)
+
+        print(green(f"\n{'=' * 64}"))
+        print(green(f"[+] Processing : {img.name}"))
+        print(green(f"    Mount point: {mount_point}"))
+        print(green(f"{'=' * 64}"))
+
+        cmd = [sys.executable, os.path.realpath(__file__),
+               "-f", str(img),
+               "-d", str(mount_point),
+               "--automate",
+               "-t", str(threads_number)]
+        result = subprocess.run(cmd)
+
+        if result.returncode != 0:
+            msg = f"[-] Failed on '{img.name}' (exit code {result.returncode})"
+            print(red(msg))
+            errors.append(msg)
+
+    print(green(f"\n[+] Batch complete — {len(images) - len(errors)}/{len(images)} image(s) processed successfully."))
+    for e in errors:
+        print(red(e))
+    sys.exit(0 if not errors else 1)
 
 if image_path:
     if not os.path.isfile(image_path):
@@ -4360,13 +4637,19 @@ if image_path:
     for i, part in enumerate(partitions, 1):
         print(f"{i}: {part}")
 
-    try:
-        part_num = int(input("\n[?] Enter the number of the partition to mount: "))
-        if not (1 <= part_num <= len(partitions)):
-            raise ValueError
-    except:
-        print(red("[-] Invalid input"))
-        sys.exit(1)
+    if automate:
+        part_num = auto_select_partition(partitions, real_image)
+        if part_num is None:
+            print(red("[-] --automate: could not determine OS partition. Aborting."))
+            sys.exit(1)
+    else:
+        try:
+            part_num = int(input("\n[?] Enter the number of the partition to mount: "))
+            if not (1 <= part_num <= len(partitions)):
+                raise ValueError
+        except:
+            print(red("[-] Invalid input"))
+            sys.exit(1)
 
     chosen_line = partitions[part_num - 1].split()
     if "*" in chosen_line:
@@ -4454,7 +4737,11 @@ if len(sys.argv) > 1:
             get_instant_messaging(computer_name, mount_path)
         else:
             print(yellow("[!] Unknown OS"))
-            run_search = input(f"The mouting point isn't a filesystem, but do you can launch some files of research on the {mount_path} directory ? It could be quite long? (yes/no): ").strip().lower()
+            if automate:
+                run_search = "yes"
+                print(yellow(f"[!] --automate: unknown OS, running file search on {mount_path} anyway."))
+            else:
+                run_search = input(f"The mouting point isn't a filesystem, but do you can launch some files of research on the {mount_path} directory ? It could be quite long? (yes/no): ").strip().lower()
             if run_search == "yes":
                 computer_name = "Unknown"
                 get_files_of_interest(mount_path, computer_name, threads_number, platform="Unknown")
@@ -4471,7 +4758,7 @@ if len(sys.argv) > 1:
 
 
     else:
-        print("Le répertoire " + mount_path + " n'existe pas")
+        print("Folder " + mount_path + " doesn't exist.")
 else:
     usage()
 
