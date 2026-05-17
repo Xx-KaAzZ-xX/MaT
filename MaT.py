@@ -465,6 +465,122 @@ def get_users_and_groups(mount_path, computer_name):
 
     print(green(f"Users and groups information written to {output_file}"))
 
+
+def _check_tor_exonerator(ip, date_str):
+    """Check if ip was a Tor exit node at date_str (YYYY-MM-DD) via ExoneraTor."""
+    try:
+        r = requests.get(
+            f"https://metrics.torproject.org/exonerator.html?ip={ip}&timestamp={date_str}&lang=en",
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return "Result is positive" in r.text
+    except Exception:
+        pass
+    return False
+
+
+def _enrich_single_ip(ip, date_str):
+    """Return asn, country, ip_type, tor_exit for one external IP."""
+    result = {"asn": "", "country": "", "ip_type": "unknown", "tor_exit": False}
+    try:
+        data     = requests.get(f"https://api.ipapi.is?q={ip}", timeout=10).json()
+        asn_info = data.get("asn", {})
+        loc      = data.get("location", {})
+        asn_num  = asn_info.get("asn")
+        asn_org  = asn_info.get("org") or data.get("company", {}).get("name", "")
+        result["asn"]     = f"AS{asn_num} {asn_org}".strip() if asn_num else ""
+        result["country"] = loc.get("country_code", "")
+
+        is_dc    = data.get("is_datacenter", False)
+        is_tor   = data.get("is_tor",   False)
+        is_vpn   = data.get("is_vpn",   False)
+        is_proxy = data.get("is_proxy", False)
+        if is_dc:
+            result["ip_type"] = "datacenter"
+        elif is_tor:
+            result["ip_type"] = "tor"
+        elif is_vpn:
+            result["ip_type"] = "vpn"
+        elif is_proxy:
+            result["ip_type"] = "proxy"
+        else:
+            ct = data.get("company", {}).get("type", "").lower()
+            at = asn_info.get("type", "").lower()
+            if ct == "isp" or at == "isp":
+                result["ip_type"] = "residential"
+            elif ct in ("hosting", "cloud"):
+                result["ip_type"] = ct
+            else:
+                result["ip_type"] = "unknown"
+    except Exception:
+        pass
+
+    result["tor_exit"] = _check_tor_exonerator(ip, date_str)
+    return result
+
+
+def _enrich_connections_background(output_file):
+    """Background thread: enrich linux_connections.csv with asn/country/ip_type/tor_exit."""
+    try:
+        df = pd.read_csv(output_file)
+        for col in ["asn", "country", "ip_type", "tor_exit"]:
+            if col not in df.columns:
+                df[col] = ""
+
+        def _is_external(ip):
+            try:
+                obj = ipaddress.ip_address(str(ip).strip())
+                return not (obj.is_private or obj.is_loopback or
+                            obj.is_link_local or obj.is_unspecified)
+            except Exception:
+                return False
+
+        # {ip: most_recent_date_str} pour les IPs externes uniquement
+        ip_dates = {}
+        for _, row in df.iterrows():
+            ip = str(row.get("src_ip", "")).strip()
+            if not _is_external(ip):
+                continue
+            try:
+                dt = pd.to_datetime(str(row.get("connection_date", "")), errors="coerce")
+                date_str = dt.strftime("%Y-%m-%d") if not pd.isna(dt) else datetime.now().strftime("%Y-%m-%d")
+            except Exception:
+                date_str = datetime.now().strftime("%Y-%m-%d")
+            if ip not in ip_dates or date_str > ip_dates[ip]:
+                ip_dates[ip] = date_str
+
+        if not ip_dates:
+            return
+
+        # Enrichissement parallèle (10 workers max)
+        ip_cache = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(_enrich_single_ip, ip, date): ip
+                for ip, date in ip_dates.items()
+            }
+            for future in as_completed(futures):
+                ip = futures[future]
+                try:
+                    ip_cache[ip] = future.result()
+                except Exception:
+                    ip_cache[ip] = {"asn": "", "country": "", "ip_type": "error", "tor_exit": False}
+
+        # Mise à jour du dataframe
+        for idx, row in df.iterrows():
+            ip = str(row.get("src_ip", "")).strip()
+            if ip in ip_cache:
+                for col in ("asn", "country", "ip_type", "tor_exit"):
+                    df.at[idx, col] = ip_cache[ip][col]
+
+        df.to_csv(output_file, index=False)
+        print(green(f"[+] IP enrichment complete → {output_file}"))
+
+    except Exception as e:
+        print(red(f"[-] IP enrichment background thread failed: {e}"))
+
+
 def list_connections(mount_path, computer_name):
     output_file = script_path + "/" + result_folder + "/" + "linux_connections.csv"
     print(yellow("[!] Retrieving connection information..."))
@@ -581,6 +697,14 @@ def list_connections(mount_path, computer_name):
         df = df.drop_duplicates(subset=['computer_name', 'connection_date', 'user', 'src_ip'])
         df.to_csv(output_file, index=False)
         print(green(f"Connections have been written into {output_file}"))
+        enrich_thread = threading.Thread(
+            target=_enrich_connections_background,
+            args=(output_file,),
+            daemon=True,
+            name="ip-enrichment",
+        )
+        enrich_thread.start()
+        print(yellow(f"[!] IP enrichment started in background (asn, country, ip_type, tor_exit)..."))
     else:
         print(yellow(f"[!] No connections has been found, {output_file} is empty"))
 
@@ -3133,6 +3257,87 @@ def hayabusa_evtx(mount_path, computer_name):
             print(f"[-] Hayabusa executable has to be in {script_path} folder.")
 
 
+def get_windows_connections(mount_path, computer_name):
+    """Extract RDP/SMB connections from hayabusa_output.csv and enrich IPs in background."""
+    hayabusa_file = os.path.join(script_path, result_folder, "hayabusa_output.csv")
+    output_file   = os.path.join(script_path, result_folder, "windows_connections.csv")
+    print(yellow("[!] Extracting Windows connections from Hayabusa output..."))
+
+    CONNECTION_EIDS = {4624, 21, 22, 24, 25, 39, 4634, 4647}
+
+    _re_ip = re.compile(
+        r'(?:SrcIP|IpAddress|SourceNetworkAddress|ClientAddress|srcIp|Ip)\s*:\s*'
+        r'((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7})',
+        re.IGNORECASE,
+    )
+    _re_user = re.compile(
+        r'(?:TargetUser|User|SubjectUser|SrcUser)\s*:\s*([^\s¦|,]+)',
+        re.IGNORECASE,
+    )
+
+    if not os.path.exists(hayabusa_file):
+        print(yellow(f"[!] {hayabusa_file} not found — skipping Windows connections."))
+        return
+
+    try:
+        df_hay = pd.read_csv(hayabusa_file, low_memory=False)
+    except Exception as e:
+        print(red(f"[-] Cannot read {hayabusa_file}: {e}"))
+        return
+
+    try:
+        df_hay["EventID"] = pd.to_numeric(df_hay["EventID"], errors="coerce")
+    except Exception:
+        pass
+
+    df_conn = df_hay[df_hay["EventID"].isin(CONNECTION_EIDS)].copy()
+
+    if df_conn.empty:
+        print(yellow("[!] No connection events found in Hayabusa output."))
+        return
+
+    rows = []
+    for _, row in df_conn.iterrows():
+        details = (str(row.get("Details", "") or "") + " "
+                   + str(row.get("ExtraFieldInfo", "") or ""))
+
+        ip_match   = _re_ip.search(details)
+        user_match = _re_user.search(details)
+
+        src_ip = ip_match.group(1).strip()   if ip_match   else ""
+        user   = user_match.group(1).strip() if user_match else ""
+
+        if not src_ip or src_ip in ("-", "::1", "127.0.0.1", "LOCAL", "0.0.0.0"):
+            continue
+
+        eid = int(row.get("EventID", 0))
+        rows.append({
+            "computer_name":   computer_name,
+            "connection_date": str(row.get("Timestamp", "")),
+            "user":            user,
+            "src_ip":          src_ip,
+            "source_file":     f"hayabusa/{row.get('Channel', '')} EID:{eid}",
+        })
+
+    if not rows:
+        print(yellow("[!] No connections with source IP found in Hayabusa output."))
+        return
+
+    df_out = pd.DataFrame(rows, columns=["computer_name", "connection_date", "user", "src_ip", "source_file"])
+    df_out = df_out.drop_duplicates(subset=["computer_name", "connection_date", "user", "src_ip"])
+    df_out.to_csv(output_file, index=False)
+    print(green(f"[+] {len(df_out)} connection(s) written to {output_file}"))
+
+    enrich_thread = threading.Thread(
+        target=_enrich_connections_background,
+        args=(output_file,),
+        daemon=True,
+        name="ip-enrichment-win",
+    )
+    enrich_thread.start()
+    print(yellow("[!] IP enrichment started in background (asn, country, ip_type, tor_exit)..."))
+
+
 ## This 3 functions are meant to detect VeraCrypt Container
 
 def has_no_signature(file_path):
@@ -4732,6 +4937,7 @@ if len(sys.argv) > 1:
             get_windows_browsing_data(mount_path, computer_name)
             get_windows_browsing_hindsight(computer_name, mount_path)
             hayabusa_evtx(mount_path, computer_name)
+            get_windows_connections(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
