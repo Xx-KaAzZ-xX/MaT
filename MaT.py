@@ -516,7 +516,7 @@ def _enrich_single_ip(ip, date_str):
     except Exception:
         pass
 
-    result["tor_exit"] = _check_tor_exonerator(ip, date_str)
+    result["tor_exit"] = str(_check_tor_exonerator(ip, date_str))
     return result
 
 
@@ -565,7 +565,7 @@ def _enrich_connections_background(output_file):
                 try:
                     ip_cache[ip] = future.result()
                 except Exception:
-                    ip_cache[ip] = {"asn": "", "country": "", "ip_type": "error", "tor_exit": False}
+                    ip_cache[ip] = {"asn": "", "country": "", "ip_type": "error", "tor_exit": "False"}
 
         # Mise à jour du dataframe
         for idx, row in df.iterrows():
@@ -4063,7 +4063,7 @@ def crypto_search(computer_name, mount_path, threads_number):
     print(yellow(f"[!] Looking now for crypto elements"))
     output_file = f"{script_path}/{result_folder}/crypto.csv"
     files_to_search = [
-        "wallet.dat", "electrum.dat", "default_wallet", "keystore", "wallet.json",
+        "wallet.dat", "electrum.dat", "default_wallet", "keystore", "wallet.json", "exodus.*",
         "UTC--", "blockchain_wallet", "keyfile", "bitcoincash.dat", "monero-wallet.dat"
     ]
     ## ici, ça passe au scan yara "crypto"
