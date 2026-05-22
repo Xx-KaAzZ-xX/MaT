@@ -4424,7 +4424,7 @@ except BaseException as tdesktop_error:
                                             token_file = fpath
                                 except Exception:
                                     continue
-            
+
                         # Écrit dans le CSV si trouvé
                         if user_id and token:
                             writer.writerow({
@@ -4438,6 +4438,24 @@ except BaseException as tdesktop_error:
             
                 except Exception as e:
                     print(red(f"Error retrieving Slack information : {e}"))
+
+            # ---- Signal ----
+            if "Signal" in dirs:
+                config_file = os.path.join(root, "Signal", "config.json")
+                if os.path.isfile(config_file):
+                    try:
+                            username = ""
+                            password = ""
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'im_app': 'Signal',
+                                'im_account': username,
+                                'im_password': password,
+                                'file_path': config_file
+                            })
+                            counter += 1
+                    except Exception as e:
+                        print(red(f"[-] Error parsing {config_file}: {e}"))
             
     if counter >= 1:        
         print(green(f"[+] Instant Messaging data have been written to {output_file} ({counter} rows)"))
