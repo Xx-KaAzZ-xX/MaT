@@ -32,6 +32,7 @@ from bech32 import bech32_decode, convertbits
 import json
 import magic
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from queue import Queue
 from threading import Lock
 import threading
@@ -49,6 +50,7 @@ from collections import OrderedDict
 #from tabulate import tabulate
 from datetime import datetime, timedelta
 import sys
+import plistlib
 from pathlib import Path
 try:
     from Registry import Registry
@@ -2780,13 +2782,11 @@ def get_windows_scheduled_tasks(mount_path, computer_name):
         print(f"[-] Error retrieving scheduled tasks: {e}")
 
 def serialize_entry(entry, computer_name, hive_name):
-    # Sérialiser chaque entrée dans un format de dictionnaire adapté pour CSV
     return {
         'computer_name': computer_name,
         'hive': hive_name,
         'subkey_name': entry.subkey_name,
         'path': entry.path,
-        #'timestamp': entry.timestamp.isoformat() if isinstance(entry.timestamp, datetime.datetime) else None,
         'timestamp': entry.timestamp,
         'values_count': entry.values_count,
         'values': [
@@ -2800,71 +2800,116 @@ def serialize_entry(entry, computer_name, hive_name):
         'actual_path': entry.actual_path
     }
 
+
+# Must be module-level for ProcessPoolExecutor pickling
+def _dump_single_hive(args):
+    """Process one hive file and write its keys to a CSV."""
+    hive_path, computer_name, output_dir = args
+
+    # Silence regipy inside each worker process
+    logging.getLogger('regipy').setLevel(logging.CRITICAL)
+
+    hive_name = os.path.basename(hive_path)
+
+    if hive_name.upper() == 'NTUSER.DAT':
+        username = os.path.basename(os.path.dirname(hive_path))
+        csv_output = os.path.join(output_dir, f"{username}_{hive_name}.csv")
+    else:
+        csv_output = os.path.join(output_dir, f"{hive_name}.csv")
+
+    fieldnames = [
+        'computer_name', 'hive', 'subkey_name', 'path',
+        'timestamp', 'values_count', 'values', 'actual_path',
+    ]
+
+    try:
+        from regipy.registry import RegistryHive
+
+        hive = RegistryHive(hive_path)
+        buffer = []
+
+        with open(csv_output, 'w', newline='', encoding='utf-8',
+                  buffering=8 * 1024 * 1024) as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            try:
+                for entry in hive.recurse_subkeys():
+                    buffer.append(serialize_entry(entry, computer_name, hive_name))
+                    if len(buffer) >= 5000:
+                        writer.writerows(buffer)
+                        buffer.clear()
+            except Exception:
+                pass  # Partial dump on corrupt hive — keep what we have
+
+            if buffer:
+                writer.writerows(buffer)
+
+        return True, hive_name, csv_output
+
+    except Exception as e:
+        return False, hive_name, str(e)
+
 def get_windows_full_registry(mount_path, computer_name):
     if automate:
         user_input = 'y'
         print(yellow("[!] --automate: dumping full registry keys."))
     else:
-        user_input = input("Do you want to dump the full registry KEYS ? It could be very long. (y/N) ").strip().lower()
-    if user_input == 'y':
-        output_dir = script_path + "/" + result_folder + "/"
-        try:
-            # Liste des hives standards
-            hive_names = ['SYSTEM', 'SOFTWARE', 'SECURITY', 'SAM']
-            ntuser_dirs = []
+        user_input = input(
+            "Do you want to dump the full registry KEYS ? It could be very long. (y/N) "
+        ).strip().lower()
 
-            # Recherche des NTUSER.DAT
-            user_dir = mount_path + "/Users/"
-            if not os.path.exists(user_dir):
-                print(yellow(f"{user_dir} doesn't exist"))
+    if user_input != 'y':
+        return
+
+    output_dir = script_path + "/" + result_folder + "/"
+
+    # Silence regipy once in the main process
+    logging.getLogger('regipy').setLevel(logging.CRITICAL)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Collect hive paths ---------------------------------------------------
+    hive_names = ['SYSTEM', 'SOFTWARE', 'SECURITY', 'SAM']
+    hive_paths = [
+        os.path.join(mount_path, 'Windows', 'System32', 'config', h)
+        for h in hive_names
+    ]
+
+    user_dir = os.path.join(mount_path, 'Users')
+    if not os.path.exists(user_dir):
+        print(yellow(f"{user_dir} doesn't exist"))
+    else:
+        for root, _, files in os.walk(user_dir):
+            for file in files:
+                if file.upper() == 'NTUSER.DAT':
+                    hive_paths.append(os.path.join(root, file))
+
+    existing = []
+    for p in hive_paths:
+        if os.path.exists(p):
+            existing.append(p)
+        else:
+            print(yellow(f"{p} doesn't exist"))
+
+    if not existing:
+        print(red("[-] No hive files found, aborting."))
+        return
+
+    # --- Parallel dump --------------------------------------------------------
+    tasks = [(p, computer_name, output_dir) for p in existing]
+    max_workers = min(len(tasks), os.cpu_count() or 1)
+
+    print(yellow(f"[+] Dumping {len(tasks)} hive(s) with {max_workers} worker(s) ..."))
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_dump_single_hive, t): t[0] for t in tasks}
+        for future in as_completed(futures):
+            ok, name, out = future.result()
+            if ok:
+                print(green(f"[+] {name} written in {out}"))
             else:
-                for root, _, files in os.walk(user_dir):
-                    for file in files:
-                        if file.upper() == 'NTUSER.DAT':
-                            ntuser_dirs.append(os.path.join(root, file))
-
-            # Ajout des hives standards
-            hive_paths = [os.path.join(mount_path, 'Windows', 'System32', 'config', h) for h in hive_names]
-            hive_paths.extend(ntuser_dirs)
-
-            os.makedirs(output_dir, exist_ok=True)
-
-            for hive_path in hive_paths:
-                if not os.path.exists(hive_path):
-                    print(yellow(f"{hive_path} doesn't exist"))
-                    continue
-
-                hive_name = os.path.basename(hive_path)
-                csv_output = os.path.join(output_dir, f"{hive_name}.csv")
-                print(yellow(f"[+] Dumping {hive_path} hive ..."))
-                hive = RegistryHive(hive_path)
-                if hive_name == "NTUSER.DAT":
-                    username = os.path.basename(os.path.dirname(hive_path))
-                    # Construire le nouveau nom de fichier
-                    csv_output = f"{output_dir}{username}_{hive_name}.csv"# Construire le nouveau nom de fichier
-
-                with open(csv_output, 'w', newline='', encoding='utf-8') as f:
-                    fieldnames = [
-                        'computer_name', 'hive', 'subkey_name', 'path', 'timestamp', 'values_count', 'values', 'actual_path'
-                    ]
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-
-                    # Redirige tous les logs de regipy vers un handler qui ignore tout
-                    logging.getLogger('regipy').addHandler(logging.NullHandler())
-
-                    # Parcourir les sous-clés et sérialiser les entrées
-                    try:
-                        for entry in hive.recurse_subkeys():
-                            #print(entry)
-                            serialized_entry = serialize_entry(entry, computer_name, hive_name)
-                            writer.writerow(serialized_entry)
-                    except Exception as e:
-                        pass
-
-                print(green(f"[+] {hive_name} written in {csv_output}"))
-        except Exception as e:
-            print(red(f"[-] Error when dumping hive file : {e}"))  
+                print(red(f"[-] Error when dumping hive file : {out}"))
 
 
 def convert_chrome_time(chrome_timestamp):
@@ -3207,7 +3252,7 @@ def get_windows_browsing_hindsight(computer_name, mount_path):
                                         match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', message)
                                         if match:
                                             try:
-                                                print(match)
+                                                #print(match)
                                                 dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
                                                 timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
                                             except:
@@ -3255,6 +3300,115 @@ def hayabusa_evtx(mount_path, computer_name):
 
         else:
             print(f"[-] Hayabusa executable has to be in {script_path} folder.")
+
+
+def get_windows_credentials(mount_path, computer_name):
+    """Extract cleartext credentials from TBAL/ARSO LSA secrets."""
+    try:
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from impacket.examples.secretsdump import LocalOperations, LSASecrets
+    except ImportError as e:
+        print(red(f"[-] Missing dependency: {e} — pip install impacket"))
+        return
+
+    output_file = os.path.join(script_path, result_folder, "windows_credentials.csv")
+    print(yellow("[!] Extracting Windows credentials (TBAL/ARSO)..."))
+
+    system_hive   = os.path.join(mount_path, 'Windows/System32/config/SYSTEM')
+    security_hive = os.path.join(mount_path, 'Windows/System32/config/SECURITY')
+
+    for label, path in (('SYSTEM', system_hive), ('SECURITY', security_hive)):
+        if not os.path.exists(path):
+            print(red(f"[-] {label} hive not found: {path}"))
+            return
+
+    def _extract_password(blob):
+        """Scan for the longest UTF-16LE printable ASCII string in the blob."""
+        best = ''
+        i = 0
+        while i < len(blob) - 1:
+            if blob[i + 1] == 0x00 and 0x20 <= blob[i] <= 0x7E:
+                j, chars = i, []
+                while j + 1 < len(blob) and blob[j + 1] == 0x00 and 0x20 <= blob[j] <= 0x7E:
+                    chars.append(chr(blob[j]))
+                    j += 2
+                word = ''.join(chars)
+                if len(word) > len(best):
+                    best = word
+                i = j
+            else:
+                i += 1
+        return best if len(best) >= 4 else None
+
+    credentials = []
+
+    def _secret_callback(secret_type, secret):
+        name = str(secret_type)
+        if 'TBAL' not in name.upper():
+            return
+        blob     = secret if isinstance(secret, bytes) else secret.encode('latin-1')
+        password = _extract_password(blob)
+        if password:
+            print(green(f"[+] TBAL credential found: {name} → {password}"))
+            credentials.append({
+                'computer_name': computer_name,
+                'password':      password,
+                'source':        f'TBAL:{name}',
+            })
+
+    def _parse_stdout_secrets(output):
+        import re as _re
+        for line in output.splitlines():
+            if 'TBAL' not in line.upper():
+                continue
+            m = _re.match(r'^(\S+)\s*:\s*(?:0x)?([0-9a-fA-F]+)', line.strip())
+            if m:
+                _secret_callback(m.group(1), bytes.fromhex(m.group(2)))
+
+    tmp_dir = tempfile.mkdtemp(prefix='mat_tbal_')
+    try:
+        sys_copy = os.path.join(tmp_dir, 'SYSTEM')
+        sec_copy = os.path.join(tmp_dir, 'SECURITY')
+        shutil.copy2(system_hive,   sys_copy)
+        shutil.copy2(security_hive, sec_copy)
+
+        try:
+            local_ops = LocalOperations(sys_copy)
+            boot_key  = local_ops.getBootKey()
+            print(green(f"[+] Boot key : {binascii.hexlify(boot_key).decode()}"))
+        except Exception as e:
+            print(red(f"[-] Boot key extraction failed: {e}"))
+            return
+
+        try:
+            lsa = LSASecrets(sec_copy, boot_key, None, isRemote=False)
+            try:
+                lsa.dumpSecrets(_secret_callback)
+            except TypeError:
+                print(yellow("[!] Older impacket — falling back to stdout capture"))
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    lsa.dumpSecrets()
+                _parse_stdout_secrets(buf.getvalue())
+        except Exception as e:
+            print(red(f"[-] LSA secrets extraction failed: {e}"))
+            return
+
+        fieldnames = ['computer_name', 'password', 'source']
+        with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(credentials)
+
+        if credentials:
+            print(green(f"[+] {len(credentials)} credential(s) written to {output_file}"))
+        else:
+            print(yellow("[!] No TBAL credentials found on this machine"))
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def get_windows_connections(mount_path, computer_name):
@@ -3651,6 +3805,8 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
         output_file = f"{script_path}/{result_folder}/linux_files_of_interest.csv"
     elif platform == "Windows":
         output_file = f"{script_path}/{result_folder}/windows_files_of_interest.csv"
+    elif platform == "macOS":
+        output_file = f"{script_path}/{result_folder}/mac_files_of_interest.csv"
     elif platform == "Unknown":
         output_file = f"{script_path}/{result_folder}/files_of_interest.csv"
 
@@ -4462,16 +4618,771 @@ except BaseException as tdesktop_error:
     else:
         print(yellow(f"[-] No IM artefacts found."))
 
+def get_mac_system_info(mac_root, mac_private, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_system_info.csv")
+    print(yellow("[!] Retrieving macOS system information..."))
+
+    info = {
+        'computer_name': computer_name,
+        'macos_version': '',
+        'macos_build': '',
+        'hostname': '',
+        'installation_date': '',
+        'timezone': '',
+    }
+
+    # macOS version
+    sys_version_path = os.path.join(mac_root, "System/Library/CoreServices/SystemVersion.plist")
+    if os.path.exists(sys_version_path):
+        try:
+            with open(sys_version_path, 'rb') as fh:
+                plist = plistlib.load(fh)
+            info['macos_version'] = plist.get('ProductUserVisibleVersion', plist.get('ProductVersion', ''))
+            info['macos_build'] = plist.get('ProductBuildVersion', '')
+        except Exception as e:
+            print(red(f"[-] Error reading SystemVersion.plist: {e}"))
+
+    # ComputerName / hostname from preferences.plist
+    # Structure: plist['System']['System']['ComputerName']
+    #            plist['System']['Network']['HostNames']['LocalHostName']
+    prefs_path = os.path.join(mac_root, "Library/Preferences/SystemConfiguration/preferences.plist")
+    if os.path.exists(prefs_path):
+        try:
+            with open(prefs_path, 'rb') as fh:
+                plist = plistlib.load(fh)
+            system_node = plist.get('System', {})
+            cn = system_node.get('System', {}).get('ComputerName', '')
+            if cn:
+                info['computer_name'] = cn
+            lhn = system_node.get('Network', {}).get('HostNames', {}).get('LocalHostName', '')
+            if lhn:
+                info['hostname'] = lhn
+        except Exception as e:
+            print(red(f"[-] Error reading preferences.plist: {e}"))
+
+    # Fallback hostname from /etc/hostname (private-dir)
+    hostname_file = os.path.join(mac_private, "etc/hostname")
+    if os.path.exists(hostname_file) and not info['hostname']:
+        try:
+            with open(hostname_file) as fh:
+                info['hostname'] = fh.read().strip()
+        except Exception:
+            pass
+
+    # Timezone via symlink /etc/localtime → .../zoneinfo/<TZ>
+    tz_file = os.path.join(mac_private, "etc/localtime")
+    if os.path.islink(tz_file):
+        try:
+            tz_target = os.readlink(tz_file)
+            info['timezone'] = re.sub(r'.*/zoneinfo/', '', tz_target)
+        except Exception:
+            pass
+
+    # Installation date from install.log creation time
+    install_log = os.path.join(mac_private, "var/log/install.log")
+    if os.path.exists(install_log):
+        try:
+            st = os.stat(install_log)
+            ts = getattr(st, 'st_birthtime', st.st_ctime)
+            info['installation_date'] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    try:
+        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=list(info.keys()))
+            writer.writeheader()
+            writer.writerow(info)
+        print(green(f"[+] macOS system information written to {output_file}"))
+    except Exception as e:
+        print(red(f"[-] Error writing mac_system_info: {e}"))
+
+    return info['computer_name']
+
+
+def get_mac_network_info(mac_root, mac_private, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_network_info.csv")
+    csv_columns = ['computer_name', 'interface', 'ip_address', 'netmask', 'gateway', 'dns_server']
+    print(yellow("[!] Retrieving macOS network information..."))
+    interfaces = []
+
+    # Hardware interfaces list
+    ni_plist = os.path.join(mac_root, "Library/Preferences/SystemConfiguration/NetworkInterfaces.plist")
+    if os.path.exists(ni_plist):
+        try:
+            with open(ni_plist, 'rb') as fh:
+                plist = plistlib.load(fh)
+            for iface in plist.get('Interfaces', []):
+                interfaces.append({
+                    'computer_name': computer_name,
+                    'interface': iface.get('BSD Name', ''),
+                    'ip_address': '',
+                    'netmask': '',
+                    'gateway': '',
+                    'dns_server': '',
+                })
+        except Exception as e:
+            print(red(f"[-] Error reading NetworkInterfaces.plist: {e}"))
+
+    # Static IP / gateway / DNS from preferences.plist NetworkServices
+    prefs_path = os.path.join(mac_root, "Library/Preferences/SystemConfiguration/preferences.plist")
+    if os.path.exists(prefs_path):
+        try:
+            with open(prefs_path, 'rb') as fh:
+                plist = plistlib.load(fh)
+            for _svc_id, svc in plist.get('NetworkServices', {}).items():
+                iface_name = svc.get('Interface', {}).get('DeviceName', '')
+                ipv4 = svc.get('IPv4', {})
+                dns = svc.get('DNS', {})
+                addresses = ipv4.get('Addresses', [])
+                masks = ipv4.get('SubnetMasks', [])
+                router = ipv4.get('Router', '')
+                dns_list = dns.get('ServerAddresses', [])
+                entry = {
+                    'computer_name': computer_name,
+                    'interface': iface_name,
+                    'ip_address': addresses[0] if addresses else '',
+                    'netmask': masks[0] if masks else '',
+                    'gateway': router,
+                    'dns_server': ','.join(dns_list),
+                }
+                updated = False
+                for existing in interfaces:
+                    if existing['interface'] == iface_name:
+                        existing.update({k: v for k, v in entry.items() if v})
+                        updated = True
+                        break
+                if not updated and iface_name:
+                    interfaces.append(entry)
+        except Exception as e:
+            print(red(f"[-] Error reading preferences.plist (network): {e}"))
+
+    # DHCP leases — enrich or add entries with actual IP, gateway, mask
+    # Leases are stored in private-dir/var/db/dhcpclient/leases/<iface>.plist
+    leases_dir = os.path.join(mac_private, "var/db/dhcpclient/leases")
+    if os.path.isdir(leases_dir):
+        for fname in os.listdir(leases_dir):
+            if not fname.endswith('.plist'):
+                continue
+            lease_path = os.path.join(leases_dir, fname)
+            try:
+                with open(lease_path, 'rb') as fh:
+                    lease = plistlib.load(fh)
+                iface_name = lease.get('InterfaceName', fname.replace('.plist', ''))
+                ip_addr    = lease.get('IPAddress', '')
+                netmask    = lease.get('SubnetMask', '')
+                gateway    = lease.get('RouterIPAddress', '')
+                dns_list   = lease.get('DNSServers', [])
+                dns_str    = ','.join(dns_list) if isinstance(dns_list, list) else str(dns_list)
+                entry = {
+                    'computer_name': computer_name,
+                    'interface': iface_name,
+                    'ip_address': ip_addr,
+                    'netmask': netmask,
+                    'gateway': gateway,
+                    'dns_server': dns_str,
+                }
+                updated = False
+                for existing in interfaces:
+                    if existing['interface'] == iface_name:
+                        for k, v in entry.items():
+                            if v and not existing.get(k):
+                                existing[k] = v
+                        updated = True
+                        break
+                if not updated and iface_name:
+                    interfaces.append(entry)
+            except Exception as e:
+                print(red(f"[-] Error reading DHCP lease {fname}: {e}"))
+
+    if interfaces:
+        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(interfaces)
+        print(green(f"[+] macOS network information written to {output_file}"))
+    else:
+        print(yellow("[!] No macOS network configuration found."))
+
+
+def get_mac_user_groups(mac_root, mac_private, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_users_and_groups.csv")
+    print(yellow("[!] Retrieving macOS users and groups..."))
+
+    passwd_candidates = [
+        os.path.join(mac_private, "etc/passwd"),
+        os.path.join(mac_root, "private/etc/passwd"),
+    ]
+    group_candidates = [
+        os.path.join(mac_private, "etc/group"),
+        os.path.join(mac_root, "private/etc/group"),
+    ]
+
+    passwd_file = next((p for p in passwd_candidates if os.path.exists(p)), None)
+    group_file = next((p for p in group_candidates if os.path.exists(p)), None)
+
+    users = []
+    if passwd_file:
+        with open(passwd_file, 'r', errors='ignore') as fh:
+            for line in fh:
+                parts = line.strip().split(':')
+                if len(parts) >= 7:
+                    users.append({'username': parts[0], 'uid': parts[2], 'gid': parts[3], 'groups': []})
+
+    if group_file:
+        with open(group_file, 'r', errors='ignore') as fh:
+            for line in fh:
+                parts = line.strip().split(':')
+                if len(parts) >= 4:
+                    groupname = parts[0]
+                    gid = parts[2]
+                    members = parts[3].split(',') if parts[3] else []
+                    for user in users:
+                        if user['username'] in members or user['gid'] == gid:
+                            user['groups'].append(groupname)
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=['computer_name', 'username', 'uid', 'gid', 'groups'])
+        writer.writeheader()
+        for user in users:
+            writer.writerow({
+                'computer_name': computer_name,
+                'username': user['username'],
+                'uid': user['uid'],
+                'gid': user['gid'],
+                'groups': ','.join(user['groups']),
+            })
+    print(green(f"[+] macOS users and groups written to {output_file}"))
+
+
+def get_mac_installed_apps(mac_root, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_installed_apps.csv")
+    csv_columns = ['computer_name', 'app_name', 'version', 'bundle_id', 'install_date', 'path']
+    print(yellow("[!] Retrieving macOS installed applications..."))
+    apps = []
+
+    app_dirs = [os.path.join(mac_root, "Applications")]
+    users_dir = os.path.join(mac_root, "Users")
+    if os.path.isdir(users_dir):
+        for user in os.listdir(users_dir):
+            user_apps = os.path.join(users_dir, user, "Applications")
+            if os.path.isdir(user_apps):
+                app_dirs.append(user_apps)
+
+    for apps_dir in app_dirs:
+        if not os.path.isdir(apps_dir):
+            continue
+        for item in os.listdir(apps_dir):
+            if not item.endswith('.app'):
+                continue
+            app_path = os.path.join(apps_dir, item)
+            try:
+                install_date = datetime.fromtimestamp(os.stat(app_path).st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                install_date = ''
+            info_plist = os.path.join(app_path, "Contents/Info.plist")
+            if os.path.exists(info_plist):
+                try:
+                    with open(info_plist, 'rb') as fh:
+                        plist = plistlib.load(fh)
+                    apps.append({
+                        'computer_name': computer_name,
+                        'app_name': plist.get('CFBundleName', item.replace('.app', '')),
+                        'version': plist.get('CFBundleShortVersionString', plist.get('CFBundleVersion', '')),
+                        'bundle_id': plist.get('CFBundleIdentifier', ''),
+                        'install_date': install_date,
+                        'path': app_path,
+                    })
+                except Exception:
+                    apps.append({
+                        'computer_name': computer_name,
+                        'app_name': item.replace('.app', ''),
+                        'version': '',
+                        'bundle_id': '',
+                        'install_date': install_date,
+                        'path': app_path,
+                    })
+
+    with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
+        writer.writeheader()
+        writer.writerows(apps)
+    print(green(f"[+] macOS installed apps written to {output_file} ({len(apps)} entries)"))
+
+
+def get_mac_browsing_history(mac_root, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_browsing_history.csv")
+    csv_columns = ['computer_name', 'source', 'user', 'url_title', 'link', 'visit_date', 'source_file']
+    print(yellow("[!] Retrieving macOS browsing history..."))
+    counter = 0
+    mac_epoch = datetime(2001, 1, 1)
+
+    users_dir = os.path.join(mac_root, "Users")
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+
+        if not os.path.isdir(users_dir):
+            print(red(f"[-] Users directory not found: {users_dir}"))
+            return
+
+        for user in os.listdir(users_dir):
+            user_dir = os.path.join(users_dir, user)
+            if not os.path.isdir(user_dir):
+                continue
+
+            # ---- Safari ----
+            safari_db = os.path.join(user_dir, "Library/Safari/History.db")
+            if os.path.exists(safari_db):
+                tmp = f"/tmp/safari_hist_{abs(hash(safari_db))}.sqlite"
+                try:
+                    shutil.copyfile(safari_db, tmp)
+                    conn = sqlite3.connect(tmp)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT hv.visit_time, hi.url, hi.domain_expansion, hi.title
+                        FROM history_visits hv
+                        JOIN history_items hi ON hv.history_item = hi.id
+                    """)
+                    for visit_time, url, domain, title in cursor.fetchall():
+                        try:
+                            visit_dt = (mac_epoch + timedelta(seconds=visit_time)).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            visit_dt = str(visit_time)
+                        writer.writerow({
+                            'computer_name': computer_name,
+                            'source': 'Safari',
+                            'user': user,
+                            'url_title': title or domain or '',
+                            'link': url,
+                            'visit_date': visit_dt,
+                            'source_file': safari_db,
+                        })
+                        counter += 1
+                    conn.close()
+                except Exception as e:
+                    print(red(f"[-] Safari history error for {user}: {e}"))
+                finally:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+
+            # ---- Chrome / Chromium / Edge — all profiles ----
+            for browser_name, browser_dir_rel in [
+                ("Chrome",   "Library/Application Support/Google/Chrome"),
+                ("Chromium", "Library/Application Support/Chromium"),
+                ("Edge",     "Library/Application Support/Microsoft Edge"),
+            ]:
+                browser_dir = os.path.join(user_dir, browser_dir_rel)
+                if not os.path.isdir(browser_dir):
+                    continue
+                # Each immediate subdirectory of the browser dir that contains a "History"
+                # file is a profile (Default, Profile 1, Profile 2, …)
+                for profile_entry in os.listdir(browser_dir):
+                    db_path = os.path.join(browser_dir, profile_entry, "History")
+                    if not os.path.isfile(db_path):
+                        continue
+                    tmp = f"/tmp/chrome_hist_{abs(hash(db_path))}.sqlite"
+                    try:
+                        shutil.copyfile(db_path, tmp)
+                        conn = sqlite3.connect(tmp)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT urls.url, urls.title, visits.visit_time FROM urls, visits WHERE urls.id = visits.url")
+                        for url, title, visit_time in cursor.fetchall():
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': f"{browser_name}/{profile_entry}",
+                                'user': user,
+                                'url_title': title,
+                                'link': url,
+                                'visit_date': convert_chrome_time(visit_time),
+                                'source_file': db_path,
+                            })
+                            counter += 1
+                        conn.close()
+                    except Exception as e:
+                        print(red(f"[-] {browser_name}/{profile_entry} history error for {user}: {e}"))
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+
+            # ---- Firefox ----
+            ff_profiles = os.path.join(user_dir, "Library/Application Support/Firefox/Profiles")
+            if os.path.isdir(ff_profiles):
+                for profile in os.listdir(ff_profiles):
+                    places = os.path.join(ff_profiles, profile, "places.sqlite")
+                    if not os.path.exists(places):
+                        continue
+                    tmp = f"/tmp/ff_places_{abs(hash(places))}.sqlite"
+                    try:
+                        shutil.copyfile(places, tmp)
+                        conn = sqlite3.connect(tmp)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT moz_places.url, moz_places.title, moz_historyvisits.visit_date
+                            FROM moz_places, moz_historyvisits
+                            WHERE moz_places.id = moz_historyvisits.place_id
+                        """)
+                        for url, title, visit_time in cursor.fetchall():
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': 'Firefox',
+                                'user': user,
+                                'url_title': title,
+                                'link': url,
+                                'visit_date': convert_firefox_time(visit_time),
+                                'source_file': places,
+                            })
+                            counter += 1
+                        conn.close()
+                    except Exception as e:
+                        print(red(f"[-] Firefox history error for {user}: {e}"))
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+
+    if counter > 0:
+        print(green(f"[+] macOS browsing history written to {output_file} ({counter} rows)"))
+    else:
+        print(yellow("[!] No macOS browsing history found."))
+
+
+def get_mac_browsing_data(mac_root, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_browsing_data.csv")
+    csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
+    print(yellow("[!] Retrieving macOS browsing data (saved logins)..."))
+    counter = 0
+
+    users_dir = os.path.join(mac_root, "Users")
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+
+        if not os.path.isdir(users_dir):
+            return
+
+        for user in os.listdir(users_dir):
+            user_dir = os.path.join(users_dir, user)
+            if not os.path.isdir(user_dir):
+                continue
+
+            # ---- Chrome / Chromium / Edge — all profiles ----
+            for browser_name, browser_dir_rel in [
+                ("Chrome",   "Library/Application Support/Google/Chrome"),
+                ("Chromium", "Library/Application Support/Chromium"),
+            ]:
+                browser_dir = os.path.join(user_dir, browser_dir_rel)
+                if not os.path.isdir(browser_dir):
+                    continue
+                for profile_entry in os.listdir(browser_dir):
+                    login_db = os.path.join(browser_dir, profile_entry, "Login Data")
+                    if not os.path.isfile(login_db):
+                        continue
+                    tmp = f"/tmp/chrome_login_{abs(hash(login_db))}.sqlite"
+                    try:
+                        shutil.copyfile(login_db, tmp)
+                        conn = sqlite3.connect(tmp)
+                        cursor = conn.cursor()
+                        try:
+                            cursor.execute("SELECT origin_url, username_value, password_value, date_created FROM logins")
+                            for url, username, password, date_created in cursor.fetchall():
+                                writer.writerow({
+                                    'computer_name': computer_name,
+                                    'source': browser_name,
+                                    'user': user,
+                                    'ident': username or '',
+                                    'creds': password or '',
+                                    'platform': url or '',
+                                    'saved_date': convert_chrome_time(date_created) if date_created else '',
+                                    'source_file': login_db,
+                                    'profile': profile_entry,
+                                })
+                                counter += 1
+                        except Exception as e:
+                            print(yellow(f"[~] Skipping logins table in {login_db}: {e}"))
+                        try:
+                            cursor.execute("SELECT origin_domain, username_value, update_time FROM stats")
+                            for url, username, update_time in cursor.fetchall():
+                                writer.writerow({
+                                    'computer_name': computer_name,
+                                    'source': f'{browser_name} (stats)',
+                                    'user': user,
+                                    'ident': username or '',
+                                    'creds': '',
+                                    'platform': url or '',
+                                    'saved_date': convert_chrome_time(update_time) if update_time else '',
+                                    'source_file': login_db,
+                                    'profile': profile_entry,
+                                })
+                                counter += 1
+                        except Exception:
+                            pass
+                        conn.close()
+                    except Exception as e:
+                        print(red(f"[-] Error processing {browser_name}/{profile_entry} logins for {user}: {e}"))
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+
+            # ---- Firefox ----
+            ff_profiles_dir = os.path.join(user_dir, "Library/Application Support/Firefox/Profiles")
+            if not os.path.isdir(ff_profiles_dir):
+                continue
+            try:
+                firefox_root = ff_profiles_dir.split("Profiles")[0]
+                decrypt_script = os.path.join(os.path.dirname(__file__), "firefox_decrypt.py")
+
+                for profile in os.listdir(ff_profiles_dir):
+                    login_path = os.path.join(ff_profiles_dir, profile, "logins.json")
+                    if not os.path.exists(login_path):
+                        continue
+
+                    if os.path.exists(decrypt_script):
+                        try:
+                            list_profiles = subprocess.run(
+                                ["python3", decrypt_script, "-l", firefox_root],
+                                capture_output=True, text=True
+                            )
+                            profile_lines = [l for l in list_profiles.stdout.splitlines() if l.strip()]
+                            for idx in range(1, len(profile_lines) + 1):
+                                result = subprocess.run(
+                                    ["python3", decrypt_script, "-n", "-c", str(idx), firefox_root],
+                                    capture_output=True, text=True
+                                )
+                                platform_url, ident, creds = "", "", ""
+                                for line in result.stdout.splitlines():
+                                    if "Website:" in line:
+                                        platform_url = line.split("Website:")[1].strip()
+                                    elif "Username:" in line:
+                                        ident = line.split("Username:")[1].strip(" '")
+                                    elif "Password:" in line:
+                                        creds = line.split("Password:")[1].strip(" '")
+                                        writer.writerow({
+                                            'computer_name': computer_name,
+                                            'source': 'Firefox (decrypted)',
+                                            'user': user,
+                                            'ident': ident,
+                                            'creds': creds,
+                                            'platform': platform_url,
+                                            'saved_date': '',
+                                            'source_file': login_path,
+                                            'profile': profile,
+                                        })
+                                        counter += 1
+                        except Exception as e:
+                            print(red(f"[-] Firefox decrypt error: {e}"))
+
+                    # Encrypted reference
+                    tmp = f"/tmp/ff_logins_{abs(hash(login_path))}.json"
+                    try:
+                        shutil.copyfile(login_path, tmp)
+                        with open(tmp, 'r', encoding='utf-8') as jf:
+                            data = json.load(jf)
+                        for entry in data.get('logins', []):
+                            ts = entry.get('timeCreated')
+                            saved = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ''
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'source': 'Firefox',
+                                'user': user,
+                                'ident': entry.get('usernameField', '') or entry.get('encryptedUsername', ''),
+                                'creds': entry.get('encryptedPassword', ''),
+                                'platform': entry.get('hostname', ''),
+                                'saved_date': saved,
+                                'source_file': login_path,
+                                'profile': profile,
+                            })
+                            counter += 1
+                    except Exception as e:
+                        print(red(f"[-] Firefox logins.json error: {e}"))
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+            except Exception as e:
+                print(red(f"[-] Firefox logins error for {user}: {e}"))
+
+    if counter:
+        print(green(f"[+] macOS browsing data written to {output_file} ({counter} rows)"))
+    else:
+        print(yellow("[!] No macOS browsing data found."))
+
+
+def get_mac_browsing_hindsight(computer_name, mac_root):
+    print(green("[+] Browsing artifacts (Hindsight) for macOS"))
+    print(yellow("[!] Retrieving macOS browser history via Hindsight..."))
+
+    users_dir = os.path.join(mac_root, "Users")
+    browsers = {
+        "chrome":   "Library/Application Support/Google/Chrome",
+        "chromium": "Library/Application Support/Chromium",
+        "edge":     "Library/Application Support/Microsoft Edge",
+        "firefox":  "Library/Application Support/Firefox",
+    }
+    hindsight_script = "hindsight/hindsight.py"
+
+    if not os.path.isdir(users_dir):
+        print(yellow(f"[!] {users_dir} not found, skipping Hindsight."))
+        return
+
+    for user in os.listdir(users_dir):
+        user_path = os.path.join(users_dir, user)
+        if not os.path.isdir(user_path):
+            continue
+        for browser, rel_path in browsers.items():
+            browser_path = os.path.join(user_path, rel_path)
+            if not os.path.exists(browser_path):
+                continue
+            output_name = os.path.join(script_path, result_folder, f"hindsight_mac_{browser}_{user}")
+            cmd = ["python3", hindsight_script, "-i", browser_path, "-f", "jsonl", "-o", output_name]
+            print(f"[+] Running Hindsight for {browser} ({user})")
+            try:
+                subprocess.run(cmd, capture_output=True, text=True)
+                jsonl_file = f"{output_name}.jsonl"
+                output_csv = os.path.join(script_path, result_folder, "mac_browser_indexeddb.csv")
+                csv_columns = ['computer_name', 'type', 'source', 'origin', 'key', 'value', 'indexeddb_database', 'date']
+                if os.path.exists(jsonl_file):
+                    with open(output_csv, mode='a', newline='', encoding='utf-8') as f_out:
+                        writer = csv.DictWriter(f_out, fieldnames=csv_columns)
+                        writer.writeheader()
+                        with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f_in:
+                            for line in f_in:
+                                try:
+                                    data = json.loads(line)
+                                    if data.get("source_long") != "Chrome IndexedDB":
+                                        continue
+                                    message = data.get("message", "")
+                                    timestamp = ""
+                                    m = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', message)
+                                    if m:
+                                        try:
+                                            timestamp = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+                                        except Exception:
+                                            pass
+                                    writer.writerow({
+                                        'computer_name': computer_name,
+                                        'type': data.get("source_long", ""),
+                                        'source': data.get("profile", ""),
+                                        'origin': data.get("origin", ""),
+                                        'key': data.get("key", ""),
+                                        'value': data.get("value", ""),
+                                        'indexeddb_database': data.get("database", ""),
+                                        'date': timestamp,
+                                    })
+                                except Exception:
+                                    continue
+            except Exception as e:
+                print(red(f"[-] Hindsight error for {browser}: {e}"))
+
+    print(green("[+] macOS Hindsight extraction finished"))
+
+
+def get_mac_connections(mac_root, mac_private, computer_name):
+    output_file = os.path.join(script_path, result_folder, "mac_connections.csv")
+    csv_columns = ['computer_name', 'connection_date', 'user', 'src_ip', 'source_file']
+    print(yellow("[!] Retrieving macOS connections..."))
+    counter = 0
+
+    with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer.writeheader()
+
+        # ---- SSH from system.log / secure.log ----
+        log_candidates = [
+            os.path.join(mac_private, "var/log/secure.log"),
+            os.path.join(mac_private, "var/log/system.log"),
+        ]
+        for log_path in log_candidates:
+            if not os.path.exists(log_path):
+                continue
+            try:
+                with open(log_path, 'r', encoding='utf-8', errors='ignore') as lf:
+                    for line in lf:
+                        if 'sshd' not in line:
+                            continue
+                        if 'Accepted' not in line and 'Disconnect' not in line:
+                            continue
+                        parts = line.split()
+                        try:
+                            connection_date = " ".join(parts[:3])
+                            user = parts[parts.index("for") + 1] if "for" in parts else ''
+                            src_ip = parts[parts.index("from") + 1] if "from" in parts else ''
+                            if not src_ip:
+                                continue
+                            writer.writerow({
+                                'computer_name': computer_name,
+                                'connection_date': connection_date,
+                                'user': user,
+                                'src_ip': src_ip,
+                                'source_file': log_path,
+                            })
+                            counter += 1
+                        except (IndexError, ValueError):
+                            continue
+            except Exception as e:
+                print(red(f"[-] Error reading {log_path}: {e}"))
+
+        # ---- Wi-Fi known networks ----
+        wifi_plist = os.path.join(mac_root, "Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist")
+        if os.path.exists(wifi_plist):
+            try:
+                with open(wifi_plist, 'rb') as fh:
+                    plist = plistlib.load(fh)
+                for ssid_key, net_info in plist.get('KnownNetworks', {}).items():
+                    ssid = net_info.get('SSIDString', ssid_key)
+                    last_joined = net_info.get('LastJoined', '')
+                    if hasattr(last_joined, 'strftime'):
+                        last_joined = last_joined.strftime("%Y-%m-%d %H:%M:%S")
+                    writer.writerow({
+                        'computer_name': computer_name,
+                        'connection_date': str(last_joined),
+                        'user': '',
+                        'src_ip': f"WiFi:{ssid}",
+                        'source_file': wifi_plist,
+                    })
+                    counter += 1
+            except Exception as e:
+                print(red(f"[-] Error reading WiFi preferences: {e}"))
+
+    if counter > 0:
+        df = pd.read_csv(output_file)
+        df = df.drop_duplicates()
+        df.to_csv(output_file, index=False)
+        print(green(f"[+] macOS connections written to {output_file} ({counter} entries)"))
+        enrich_thread = threading.Thread(
+            target=_enrich_connections_background,
+            args=(output_file,),
+            daemon=True,
+            name="ip-enrichment-mac",
+        )
+        enrich_thread.start()
+        print(yellow("[!] IP enrichment started in background (asn, country, ip_type, tor_exit)..."))
+    else:
+        print(yellow("[!] No macOS connections found."))
+
+
+##############################################################
+# End of macOS functions
+##############################################################
 
 def determine_platform(mount_path):
     linux_indicators = ['etc', 'var', 'usr']
     windows_indicators = ['Windows', 'Program Files', 'Users']
+    mac_root_indicators = ['System', 'Applications', 'Library']
 
-    # List directories in the mount point
     try:
         dirs = os.listdir(mount_path)
     except FileNotFoundError:
         return "Mount point not found"
+
+    # macOS structure: root/ + private-dir/ subdirectories
+    if 'root' in dirs and 'private-dir' in dirs:
+        root_sub = os.path.join(mount_path, 'root')
+        try:
+            root_dirs = os.listdir(root_sub)
+            mac_count = sum(1 for d in root_dirs if d in mac_root_indicators)
+            if mac_count >= 2:
+                return "macOS"
+        except Exception:
+            pass
 
     linux_count = sum(1 for d in dirs if d in linux_indicators)
     windows_count = sum(1 for d in dirs if d in windows_indicators)
@@ -4557,14 +5468,23 @@ def get_mft(computer_name, image_path, byte_offset):
         print(green(f"[+] MFT raw extracted to {mft_raw_path}"))
 
         # Analyse avec analyzeMFT.py
-        os.system(f"analyzeMFT.py -f {mft_raw_path} -o {mft_csv_path} -p")
+        #os.system(f"analyzeMFT.py -f {mft_raw_path} -o {mft_csv_path}")
         #os.system(f"analyzemft -f {mft_raw_path} -o {mft_csv_path}")
+        result = subprocess.run(
+            ["analyzemft", "-f", mft_raw_path, "-o", mft_csv_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"Erreur analyzemft : {result.stderr}")
+
         if os.path.exists(mft_csv_path):
             df = pd.read_csv(mft_csv_path)
             df['computer_name'] = computer_name
             df.to_csv(mft_csv_path, index=False)
             print(green(f"[+] MFT parsed to {mft_csv_path}"))
-            os.remove(mft_raw_path)
+            #os.remove(mft_raw_path)
 
     except Exception as e:
         print(red(f"[-] Error extracting or parsing MFT: {e}"))
@@ -4951,6 +5871,7 @@ if len(sys.argv) > 1:
             get_windows_executed_programs(mount_path, computer_name)
             get_windows_scheduled_tasks(mount_path, computer_name)
             get_windows_full_registry(mount_path, computer_name)
+            get_windows_credentials(mount_path, computer_name)
             get_windows_browsing_history(mount_path, computer_name)
             get_windows_browsing_data(mount_path, computer_name)
             get_windows_browsing_hindsight(computer_name, mount_path)
@@ -4959,6 +5880,24 @@ if len(sys.argv) > 1:
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
+        elif platform == "macOS":
+            mac_root = os.path.join(mount_path, 'root')
+            mac_private = os.path.join(mount_path, 'private-dir')
+            if not mac_root.endswith('/'):
+                mac_root += '/'
+            if not mac_private.endswith('/'):
+                mac_private += '/'
+            computer_name = get_mac_system_info(mac_root, mac_private, "Unknown")
+            get_mac_network_info(mac_root, mac_private, computer_name)
+            get_mac_user_groups(mac_root, mac_private, computer_name)
+            get_mac_installed_apps(mac_root, computer_name)
+            get_mac_browsing_history(mac_root, computer_name)
+            get_mac_browsing_data(mac_root, computer_name)
+            get_mac_browsing_hindsight(computer_name, mac_root)
+            get_mac_connections(mac_root, mac_private, computer_name)
+            get_files_of_interest(mac_root, computer_name, threads_number, platform)
+            find_potential_db_leaks(computer_name, mac_root)
+            get_instant_messaging(computer_name, mac_root)
         else:
             print(yellow("[!] Unknown OS"))
             if automate:
