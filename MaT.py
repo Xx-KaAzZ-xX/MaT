@@ -1874,13 +1874,237 @@ def get_linux_used_space(mount_path, computer_name):
         print(red(f"[-] An error occurred while gathering disk usage information: {e}"))
 
 
+# ── BuildKit history.db helpers ───────────────────────────────────────────
+
+_BOLTDB_PAGE_HDR  = 16   # page header : id(8) + flags(2) + count(2) + overflow(4)
+_BOLTDB_LEAF_ELEM = 16   # leaf element: flags(4) + pos(4) + ksize(4) + vsize(4)
+_BOLTDB_LEAF_FLAG = 0x02
+
+def _boltdb_records(path):
+    """Yield (key: bytes, value: bytes) from every leaf page of a BoltDB file."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    # pageSize: meta struct starts at page offset 16; pageSize sits at meta+8
+    # (magic 4 + version 4 = 8), so absolute offset = 16 + 8 = 24
+    try:
+        ps = struct.unpack_from("<I", raw, 24)[0]
+        if ps not in (4096, 8192, 16384, 32768, 65536):
+            ps = 4096
+    except Exception:
+        ps = 4096
+    for p in range(len(raw) // ps):
+        pg = raw[p * ps : (p + 1) * ps]
+        if len(pg) < _BOLTDB_PAGE_HDR:
+            continue
+        flags, count = struct.unpack_from("<HH", pg, 8)
+        if flags != _BOLTDB_LEAF_FLAG or not (0 < count < 2000):
+            continue
+        for i in range(count):
+            off = _BOLTDB_PAGE_HDR + i * _BOLTDB_LEAF_ELEM
+            if off + _BOLTDB_LEAF_ELEM > len(pg):
+                break
+            _, pos, ks, vs = struct.unpack_from("<4I", pg, off)
+            k0 = off + pos
+            v0 = k0 + ks
+            if v0 + vs > len(pg):
+                continue
+            yield pg[k0 : k0 + ks], pg[v0 : v0 + vs]
+
+
+def _read_varint(buf, pos):
+    r = s = 0
+    while pos < len(buf):
+        b = buf[pos]; pos += 1
+        r |= (b & 0x7F) << s
+        if not (b & 0x80):
+            return r, pos
+        s += 7
+    return r, pos
+
+
+_TS_MIN = 1_420_070_400   # 2015-01-01 UTC
+_TS_MAX = 2_051_222_400   # 2035-01-01 UTC
+
+
+def _walk_proto(buf, depth=0):
+    """
+    Recursively walk protobuf bytes.
+    Yield ("str", field_no, str_value) for printable length-delimited fields,
+    or  ("ts",  field_no, epoch_sec)  for plausible Unix-epoch timestamps.
+    """
+    if depth > 8:
+        return
+    pos = 0
+    while pos < len(buf):
+        try:
+            tag, pos = _read_varint(buf, pos)
+        except Exception:
+            return
+        wt, fn = tag & 7, tag >> 3
+        if wt == 0:                              # varint
+            try:
+                val, pos = _read_varint(buf, pos)
+            except Exception:
+                return
+            if _TS_MIN <= val <= _TS_MAX:
+                yield ("ts", fn, val)
+        elif wt == 1:                            # 64-bit fixed
+            if pos + 8 > len(buf):
+                return
+            val = struct.unpack_from("<Q", buf, pos)[0]
+            pos += 8
+            if _TS_MIN <= val <= _TS_MAX:
+                yield ("ts", fn, val)
+        elif wt == 2:                            # length-delimited
+            try:
+                ln, pos = _read_varint(buf, pos)
+            except Exception:
+                return
+            if ln < 0 or pos + ln > len(buf):
+                return
+            chunk = buf[pos : pos + ln]
+            pos += ln
+            try:
+                s = chunk.decode("utf-8")
+                if s.isprintable() and s.strip():
+                    yield ("str", fn, s)
+                    continue    # string field → no need to recurse
+            except (UnicodeDecodeError, ValueError):
+                pass
+            yield from _walk_proto(chunk, depth + 1)   # embedded message
+        elif wt == 5:                            # 32-bit fixed
+            pos += 4
+        else:
+            return
+
+
+_KNOWN_REGISTRIES = (
+    "docker.io/", "ghcr.io/", "gcr.io/", "quay.io/",
+    "mcr.microsoft.com/", "k8s.gcr.io/", "registry.k8s.io/",
+)
+
+def _looks_like_image_ref(s):
+    s = s.strip()
+    if not s or len(s) > 300 or " " in s or s.startswith("/") or s.startswith("."):
+        return False
+    if any(s.startswith(p) for p in _KNOWN_REGISTRIES):
+        return True
+    # private registry: host.tld/path or IP:port/path
+    if re.match(r"^(?:[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?/[a-z0-9]", s):
+        return True
+    # namespace/image[:tag]
+    if re.match(r"^[a-z0-9][a-z0-9._\-]*/[a-z0-9][a-z0-9._\-/]*(:[a-zA-Z0-9._\-]+)?$", s):
+        return True
+    return False
+
+
+def _parse_metadata_v2(mount_path):
+    """
+    Parse /var/lib/docker/buildkit/metadata_v2.db.
+
+    Dans ce fichier BoltDB les champs de chaque enregistrement sont stockés comme
+    des paires clé-valeur adjacentes dans la zone de données des pages feuilles,
+    ce qui donne des blocs lisibles du type :
+        cache.description{"value":"pulled from docker.io/...@sha256:..."}
+        cache.diffID{"value":"sha256:<layer_diff_hash>"}
+        cache.createdAt{"value":<nanoseconds>}
+
+    Retourne un dict : diffID (sha256:...) → {"url": str, "pull_time": str}
+    Le lien avec un conteneur se fait via les diff_ids de l'imagedb.
+    """
+    db_path = os.path.join(mount_path, "var/lib/docker/buildkit/metadata_v2.db")
+    if not os.path.exists(db_path):
+        return {}
+
+    with open(db_path, "rb") as f:
+        raw = f.read()
+
+    # latin-1 : décodage sans erreur (octet → codepoint 1-1)
+    content = raw.decode("latin-1")
+
+    desc_re = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
+    diff_re = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
+    ts_re   = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
+
+    result  = {}
+    WINDOW  = 3000  # les champs d'un même enregistrement tiennent dans ~1 page (4 ko)
+
+    for m in desc_re.finditer(content):
+        url = m.group(1)
+        pos = m.start()
+        segment = content[max(0, pos - WINDOW) : pos + WINDOW]
+
+        diff_m = diff_re.search(segment)
+        if not diff_m:
+            continue
+        diff_id = diff_m.group(1)
+
+        pull_time = ""
+        ts_m = ts_re.search(segment)
+        if ts_m:
+            ns = int(ts_m.group(1))
+            pull_time = datetime.fromtimestamp(ns / 1e9, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        result[diff_id] = {"url": url, "pull_time": pull_time}
+
+    return result
+
+
+def _get_image_info(mount_path, image_field, metadata_v2):
+    """
+    Lit l'imagedb pour un conteneur et retourne (image_url, build_time).
+
+      image_field  : champ "Image" de config.v2.json, ex. "sha256:<hash>"
+      metadata_v2  : dict retourné par _parse_metadata_v2()
+
+      image_url    : URL de téléchargement depuis metadata_v2.db
+                     (ex. "docker.io/library/nginx:latest@sha256:...")
+                     vide si l'image a été construite localement
+      build_time   : champ "created" de l'imagedb (date de création de l'image)
+    """
+    if not image_field or ":" not in image_field:
+        return "", ""
+
+    algo, digest = image_field.split(":", 1)
+    imagedb_path = os.path.join(
+        mount_path, "var/lib/docker/image/overlay2/imagedb/content", algo, digest
+    )
+    if not os.path.exists(imagedb_path):
+        return "", ""
+
+    try:
+        with open(imagedb_path, "r", encoding="utf-8") as f:
+            img_data = json.load(f)
+    except Exception:
+        return "", ""
+
+    build_time = img_data.get("created", "")
+
+    image_url = ""
+    for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
+        if diff_id in metadata_v2:
+            image_url = metadata_v2[diff_id]["url"]
+            break
+
+    return image_url, build_time
+
+# ─────────────────────────────────────────────────────────────────────────
+
+
 def get_linux_docker(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_docker.csv")
-    csv_columns = ['computer_name', 'container_name', 'container_state', 'container_ip', 'exposed_ports', 'volumes', 'container_logs', 'overlay_directory']
+    csv_columns = [
+        'computer_name', 'container_name', 'container_state', 'container_ip',
+        'exposed_ports', 'volumes', 'container_logs', 'overlay_directory',
+        'image_url', 'build_time',
+    ]
     print(yellow("[!] Retrieving docker containers information..."))
     docker_containers_dir = os.path.join(mount_path, "var/lib/docker/containers")
     overlay_dir = os.path.join(mount_path, "var/lib/docker/overlay2")
-  
+
+    # Parsé une seule fois pour tous les conteneurs
+    metadata_v2 = _parse_metadata_v2(mount_path)
+
     try:
         counter = 0
         with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
@@ -1929,6 +2153,11 @@ def get_linux_docker(mount_path, computer_name):
                     else:
                         overlay_directory = "Unknown"
 
+                    # ── image_url (metadata_v2.db → diff_ids) & build_time (imagedb) ──
+                    image_url, build_time = _get_image_info(
+                        mount_path, data.get("Image", ""), metadata_v2
+                    )
+
                     writer.writerow({
                         "computer_name": computer_name,
                         "container_name": container_name,
@@ -1937,7 +2166,9 @@ def get_linux_docker(mount_path, computer_name):
                         "exposed_ports": container_ports,
                         "volumes": volumes,
                         "container_logs": container_logs,
-                        "overlay_directory": overlay_directory
+                        "overlay_directory": overlay_directory,
+                        "image_url": image_url,
+                        "build_time": build_time,
                     })
                     counter += 1
 
