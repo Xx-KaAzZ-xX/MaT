@@ -7,8 +7,8 @@ rule Detect_Crypto_Elements {
         $bitcoin_p2sh = /\b3[a-km-zA-HJ-NP-Z1-9][a-km-zA-HJ-NP-Z0-9]{24,33}\b/
         $bitcoin_bech32 = /\bbc1q[a-z0-9]{38,58}\b/
         $bitcoin_taproot = /\bbc1p[a-z0-9]{58}\b/
+        // bitcoin_txid also works for ltc and monero TXID
         $bitcoin_txid = /\b[a-fA-F0-9]{64}\b/
-        //$monero = /\b4[0-9AB][0-9a-zA-Z]{93}\b/
         $monero = /\b4[0-9AB][a-km-zA-HJ-NP-Z1-9]{93}\b/
         //$litecoin_legacy = /\bL[a-km-zA-HJ-NP-Z1-9]*[0-9][a-km-zA-HJ-NP-Z1-9]{25,32}\b/
         $litecoin_legacy = /\bL[a-km-zA-HJ-NP-Z1-9]{32,33}\b/
@@ -25,7 +25,7 @@ rule Detect_Crypto_Elements {
         $publicEscapeWalletNodeBIP32 = /\bx\x00p\x00u\x00b\x00([a-km-zA-HJ-NP-Z1-9]\x00){107,108}\b/
         $ethereum_address = /\b0x[a-fA-F0-9]{40}\b/
         $ethereum_address_unicode = /\b0\x00x\x00([a-fA-F0-9]\x00){40}\b/
-        //$md5 = /\b[a-f0-9]{32}\b/ // Pattern for MD5 hashes
+        $ethereum_txid = /\b0x[a-fA-F0-9]{64}\b/
 
     condition:
          filesize < 20000MB and
