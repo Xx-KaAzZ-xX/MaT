@@ -1874,221 +1874,188 @@ def get_linux_used_space(mount_path, computer_name):
         print(red(f"[-] An error occurred while gathering disk usage information: {e}"))
 
 
-# ── BuildKit history.db helpers ───────────────────────────────────────────
-
-_BOLTDB_PAGE_HDR  = 16   # page header : id(8) + flags(2) + count(2) + overflow(4)
-_BOLTDB_LEAF_ELEM = 16   # leaf element: flags(4) + pos(4) + ksize(4) + vsize(4)
-_BOLTDB_LEAF_FLAG = 0x02
-
-def _boltdb_records(path):
-    """Yield (key: bytes, value: bytes) from every leaf page of a BoltDB file."""
-    with open(path, "rb") as f:
-        raw = f.read()
-    # pageSize: meta struct starts at page offset 16; pageSize sits at meta+8
-    # (magic 4 + version 4 = 8), so absolute offset = 16 + 8 = 24
-    try:
-        ps = struct.unpack_from("<I", raw, 24)[0]
-        if ps not in (4096, 8192, 16384, 32768, 65536):
-            ps = 4096
-    except Exception:
-        ps = 4096
-    for p in range(len(raw) // ps):
-        pg = raw[p * ps : (p + 1) * ps]
-        if len(pg) < _BOLTDB_PAGE_HDR:
-            continue
-        flags, count = struct.unpack_from("<HH", pg, 8)
-        if flags != _BOLTDB_LEAF_FLAG or not (0 < count < 2000):
-            continue
-        for i in range(count):
-            off = _BOLTDB_PAGE_HDR + i * _BOLTDB_LEAF_ELEM
-            if off + _BOLTDB_LEAF_ELEM > len(pg):
-                break
-            _, pos, ks, vs = struct.unpack_from("<4I", pg, off)
-            k0 = off + pos
-            v0 = k0 + ks
-            if v0 + vs > len(pg):
-                continue
-            yield pg[k0 : k0 + ks], pg[v0 : v0 + vs]
-
-
-def _read_varint(buf, pos):
-    r = s = 0
-    while pos < len(buf):
-        b = buf[pos]; pos += 1
-        r |= (b & 0x7F) << s
-        if not (b & 0x80):
-            return r, pos
-        s += 7
-    return r, pos
-
-
-_TS_MIN = 1_420_070_400   # 2015-01-01 UTC
-_TS_MAX = 2_051_222_400   # 2035-01-01 UTC
-
-
-def _walk_proto(buf, depth=0):
-    """
-    Recursively walk protobuf bytes.
-    Yield ("str", field_no, str_value) for printable length-delimited fields,
-    or  ("ts",  field_no, epoch_sec)  for plausible Unix-epoch timestamps.
-    """
-    if depth > 8:
-        return
-    pos = 0
-    while pos < len(buf):
-        try:
-            tag, pos = _read_varint(buf, pos)
-        except Exception:
-            return
-        wt, fn = tag & 7, tag >> 3
-        if wt == 0:                              # varint
-            try:
-                val, pos = _read_varint(buf, pos)
-            except Exception:
-                return
-            if _TS_MIN <= val <= _TS_MAX:
-                yield ("ts", fn, val)
-        elif wt == 1:                            # 64-bit fixed
-            if pos + 8 > len(buf):
-                return
-            val = struct.unpack_from("<Q", buf, pos)[0]
-            pos += 8
-            if _TS_MIN <= val <= _TS_MAX:
-                yield ("ts", fn, val)
-        elif wt == 2:                            # length-delimited
-            try:
-                ln, pos = _read_varint(buf, pos)
-            except Exception:
-                return
-            if ln < 0 or pos + ln > len(buf):
-                return
-            chunk = buf[pos : pos + ln]
-            pos += ln
-            try:
-                s = chunk.decode("utf-8")
-                if s.isprintable() and s.strip():
-                    yield ("str", fn, s)
-                    continue    # string field → no need to recurse
-            except (UnicodeDecodeError, ValueError):
-                pass
-            yield from _walk_proto(chunk, depth + 1)   # embedded message
-        elif wt == 5:                            # 32-bit fixed
-            pos += 4
-        else:
-            return
-
-
-_KNOWN_REGISTRIES = (
-    "docker.io/", "ghcr.io/", "gcr.io/", "quay.io/",
-    "mcr.microsoft.com/", "k8s.gcr.io/", "registry.k8s.io/",
-)
-
-def _looks_like_image_ref(s):
-    s = s.strip()
-    if not s or len(s) > 300 or " " in s or s.startswith("/") or s.startswith("."):
-        return False
-    if any(s.startswith(p) for p in _KNOWN_REGISTRIES):
-        return True
-    # private registry: host.tld/path or IP:port/path
-    if re.match(r"^(?:[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?/[a-z0-9]", s):
-        return True
-    # namespace/image[:tag]
-    if re.match(r"^[a-z0-9][a-z0-9._\-]*/[a-z0-9][a-z0-9._\-/]*(:[a-zA-Z0-9._\-]+)?$", s):
-        return True
-    return False
-
-
 def _parse_metadata_v2(mount_path):
     """
     Parse /var/lib/docker/buildkit/metadata_v2.db.
 
-    Dans ce fichier BoltDB les champs de chaque enregistrement sont stockés comme
-    des paires clé-valeur adjacentes dans la zone de données des pages feuilles,
-    ce qui donne des blocs lisibles du type :
-        cache.description{"value":"pulled from docker.io/...@sha256:..."}
-        cache.diffID{"value":"sha256:<layer_diff_hash>"}
-        cache.createdAt{"value":<nanoseconds>}
+    Les champs de chaque enregistrement sont des paires clé-valeur adjacentes
+    dans la zone de données des pages feuilles BoltDB, lisibles sous la forme :
+        cache.description{"value":"pulled from <url>"}
+        cache.diffID{"value":"sha256:<hash>"}
+        cache.createdAt{"value":<nanosecondes>}
 
     Retourne un dict : diffID (sha256:...) → {"url": str, "pull_time": str}
     Le lien avec un conteneur se fait via les diff_ids de l'imagedb.
     """
-    db_path = os.path.join(mount_path, "var/lib/docker/buildkit/metadata_v2.db")
-    if not os.path.exists(db_path):
-        return {}
+    result = {}
+    try:
+        candidates = [
+            os.path.join(mount_path, "var", "lib", "docker", "buildkit", "metadata_v2.db"),
+            os.path.join(mount_path, "data", "docker", "buildkit", "containerd-overlayfs", "metadata_v2.db"),
+        ]
+        db_path = next((p for p in candidates if os.path.exists(p)), None)
+        if db_path is None:
+            return result
 
-    with open(db_path, "rb") as f:
-        raw = f.read()
+        with open(db_path, "rb") as f:
+            raw = f.read()
 
-    # latin-1 : décodage sans erreur (octet → codepoint 1-1)
-    content = raw.decode("latin-1")
+        content = raw.decode("latin-1")  # latin-1 : décodage sans erreur (octet → codepoint 1-1)
 
-    desc_re = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
-    diff_re = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
-    ts_re   = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
+        desc_re = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
+        diff_re = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
+        ts_re   = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
+        WINDOW  = 3000  # les champs d'un même enregistrement tiennent dans ~1 page (4 ko)
 
-    result  = {}
-    WINDOW  = 3000  # les champs d'un même enregistrement tiennent dans ~1 page (4 ko)
+        for m in desc_re.finditer(content):
+            try:
+                url     = m.group(1)
+                pos     = m.start()
+                segment = content[max(0, pos - WINDOW) : pos + WINDOW]
 
-    for m in desc_re.finditer(content):
-        url = m.group(1)
-        pos = m.start()
-        segment = content[max(0, pos - WINDOW) : pos + WINDOW]
+                diff_m = diff_re.search(segment)
+                if not diff_m:
+                    continue
+                diff_id = diff_m.group(1)
 
-        diff_m = diff_re.search(segment)
-        if not diff_m:
-            continue
-        diff_id = diff_m.group(1)
+                pull_time = ""
+                ts_m = ts_re.search(segment)
+                if ts_m:
+                    try:
+                        ns = int(ts_m.group(1))
+                        pull_time = (
+                            datetime(1970, 1, 1) + timedelta(seconds=ns / 1e9)
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    except Exception:
+                        pass
 
-        pull_time = ""
-        ts_m = ts_re.search(segment)
-        if ts_m:
-            ns = int(ts_m.group(1))
-            pull_time = datetime.fromtimestamp(ns / 1e9, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                result[diff_id] = {"url": url, "pull_time": pull_time}
+            except Exception:
+                continue
 
-        result[diff_id] = {"url": url, "pull_time": pull_time}
+    except Exception:
+        pass
 
     return result
 
 
-def _get_image_info(mount_path, image_field, metadata_v2):
+def _get_image_info(docker_root, image_field, metadata_v2):
     """
     Lit l'imagedb pour un conteneur et retourne (image_url, build_time).
 
+      docker_root  : racine des données Docker (var/lib/docker ou data/docker)
       image_field  : champ "Image" de config.v2.json, ex. "sha256:<hash>"
       metadata_v2  : dict retourné par _parse_metadata_v2()
-
-      image_url    : URL de téléchargement depuis metadata_v2.db
-                     (ex. "docker.io/library/nginx:latest@sha256:...")
-                     vide si l'image a été construite localement
-      build_time   : champ "created" de l'imagedb (date de création de l'image)
     """
-    if not image_field or ":" not in image_field:
-        return "", ""
-
-    algo, digest = image_field.split(":", 1)
-    imagedb_path = os.path.join(
-        mount_path, "var/lib/docker/image/overlay2/imagedb/content", algo, digest
-    )
-    if not os.path.exists(imagedb_path):
-        return "", ""
-
     try:
+        if not image_field or ":" not in image_field:
+            return "", ""
+
+        algo, digest = image_field.split(":", 1)
+        imagedb_path = os.path.join(
+            docker_root, "image", "overlay2", "imagedb", "content", algo, digest
+        )
+        if not os.path.exists(imagedb_path):
+            return "", ""
+
         with open(imagedb_path, "r", encoding="utf-8") as f:
             img_data = json.load(f)
+
+        build_time = img_data.get("created", "")
+
+        image_url = ""
+        for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
+            if diff_id in metadata_v2:
+                image_url = metadata_v2[diff_id]["url"]
+                break
+
+        return image_url, build_time
+
     except Exception:
         return "", ""
 
-    build_time = img_data.get("created", "")
-
-    image_url = ""
-    for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
-        if diff_id in metadata_v2:
-            image_url = metadata_v2[diff_id]["url"]
-            break
-
-    return image_url, build_time
-
 # ─────────────────────────────────────────────────────────────────────────
+
+
+def _collect_docker_containers(mount_path, computer_name):
+    """Parse Docker containers from a mounted filesystem. Returns a list of row dicts.
+    Handles both standard Linux layout (var/lib/docker) and Docker Desktop VHDX (data/docker)."""
+    rows = []
+    try:
+        docker_root = None
+        for candidate in (
+            os.path.join(mount_path, "var", "lib", "docker"),
+            os.path.join(mount_path, "data", "docker"),
+        ):
+            if os.path.isdir(candidate):
+                docker_root = candidate
+                break
+        if docker_root is None:
+            return rows
+
+        docker_containers_dir = os.path.join(docker_root, "containers")
+        if not os.path.isdir(docker_containers_dir):
+            return rows
+
+        metadata_v2 = _parse_metadata_v2(mount_path)
+
+        for container_id in os.listdir(docker_containers_dir):
+            config_path = os.path.join(docker_containers_dir, container_id, "config.v2.json")
+            if not os.path.isfile(config_path):
+                continue
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                container_name  = data.get("Name", "").lstrip("/")
+                container_state = data.get("State", {}).get("Running", "")
+                container_ip    = ""
+                networks = data.get("NetworkSettings", {}).get("Networks", {})
+                for net_data in networks.values():
+                    ip = net_data.get("IPAddress")
+                    if ip:
+                        container_ip = ip
+                        break
+                container_ports = ",".join(
+                    data.get("Config", {}).get("ExposedPorts", {}).keys()
+                ) if data.get("Config", {}).get("ExposedPorts") else ""
+                container_logs = data.get("LogPath", "") or ""
+                if container_logs:
+                    container_logs = os.path.join(mount_path, container_logs.lstrip("/"))
+                mounts  = data.get("MountPoints", {})
+                volumes = ",".join([m.get("Source", "") for m in mounts.values() if "Source" in m])
+                graphdriver = data.get("GraphDriver", {})
+                graph_data  = graphdriver.get("Data", {})
+                merged_dir  = graph_data.get("MergedDir", "")
+                if merged_dir:
+                    if merged_dir.startswith("/var/lib/docker") or merged_dir.startswith("/data/docker"):
+                        overlay_directory = os.path.join(mount_path, merged_dir.lstrip("/"))
+                    else:
+                        overlay_directory = merged_dir
+                else:
+                    overlay_directory = "Unknown"
+
+                image_url, build_time = _get_image_info(
+                    docker_root, data.get("Image", ""), metadata_v2
+                )
+
+                rows.append({
+                    "computer_name":     computer_name,
+                    "container_name":    container_name,
+                    "container_state":   container_state,
+                    "container_ip":      container_ip,
+                    "exposed_ports":     container_ports,
+                    "volumes":           volumes,
+                    "container_logs":    container_logs,
+                    "overlay_directory": overlay_directory,
+                    "image_url":         image_url,
+                    "build_time":        build_time,
+                })
+            except Exception as e:
+                print(red(f"[-] Error processing container {container_id}: {e}"))
+    except Exception as e:
+        print(red(f"[-] Error collecting docker containers: {e}"))
+    return rows
 
 
 def get_linux_docker(mount_path, computer_name):
@@ -2099,11 +2066,235 @@ def get_linux_docker(mount_path, computer_name):
         'image_url', 'build_time',
     ]
     print(yellow("[!] Retrieving docker containers information..."))
-    docker_containers_dir = os.path.join(mount_path, "var/lib/docker/containers")
-    overlay_dir = os.path.join(mount_path, "var/lib/docker/overlay2")
+    try:
+        rows = _collect_docker_containers(mount_path, computer_name)
+        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        if rows:
+            print(green(f"Dockers data has been written into {output_file}"))
+        else:
+            print(yellow(f"No dockers data found, {output_file} should be empty"))
+    except Exception as e:
+        print(red(f"[-] Error writing Docker info: {e}"))
 
-    # Parsé une seule fois pour tous les conteneurs
-    metadata_v2 = _parse_metadata_v2(mount_path)
+
+# ── IA applications ───────────────────────────────────────────────────────
+
+# Répertoires identifiant directement une app (nom exact du dossier)
+_IA_DIR_NAMES = {
+    ".claude":   "Claude Code",
+    ".aider":    "Aider",
+    ".ollama":   "Ollama",
+    ".lmstudio": "LM Studio",
+    ".continue": "Continue.dev",
+}
+
+# Fichiers identifiant une app (nom exact, cherchés partout sur le FS)
+_IA_FILE_NAMES = {
+    ".aider.chat.history.md": "Aider",
+    ".aider.input.history":   "Aider",
+}
+
+# Répertoires identifiant une app uniquement quand leur parent est un dossier
+# de données applicatives (AppData/Roaming, .config, Application Support, etc.)
+_IA_APPDATA_NAMES = {
+    "Cursor":     "Cursor",
+    "ChatGPT":    "ChatGPT",
+    "Perplexity": "Perplexity",
+    "Jan":        "Jan.ai",
+    "LM Studio":  "LM Studio",
+    "nomic.ai":   "GPT4All",
+    "Continue":   "Continue.dev",
+}
+
+_APPDATA_PARENTS = {
+    "Roaming", "Local", ".config",
+    "Application Support", "ApplicationData",
+}
+
+# Répertoires à ignorer lors du walk (pseudo-FS, paquets, caches volumineux)
+_FS_SKIP = {
+    "proc", "sys", "dev", "run", "snap", "boot", "lost+found",
+    "$Recycle.Bin", "System Volume Information",
+    "node_modules", ".git", "__pycache__", ".npm", ".cargo",
+    "site-packages", "dist-packages",
+}
+
+
+def get_ia_apps(mount_path, computer_name):
+    output_file = os.path.join(script_path, result_folder, "ia_apps.csv")
+    csv_columns  = ['computer_name', 'ia_app', 'file_path']
+    print(yellow("[!] Searching for AI assistant application artifacts (full FS scan)..."))
+
+    try:
+        counter  = 0
+        reported = set()   # évite les doublons (même chemin via chemins symlinks)
+
+        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
+            writer.writeheader()
+
+            def _write(app, path):
+                nonlocal counter
+                if path in reported:
+                    return
+                reported.add(path)
+                writer.writerow({
+                    "computer_name": computer_name,
+                    "ia_app":        app,
+                    "file_path":     path,
+                })
+                counter += 1
+
+            for root, dirs, files in os.walk(mount_path, topdown=True, onerror=lambda e: None):
+                # Élagage : on ne descend pas dans les répertoires à ignorer
+                dirs[:] = [d for d in dirs if d not in _FS_SKIP]
+
+                rel_root = os.path.relpath(root, mount_path)
+                parent_name = os.path.basename(root)
+
+                # ── Détection sur les sous-répertoires ───────────────────
+                for d in list(dirs):
+                    full_d = os.path.join(root, d)
+
+                    # 1. Nom de dossier identifiant directement une app
+                    if d in _IA_DIR_NAMES:
+                        _write(_IA_DIR_NAMES[d], full_d)
+                        dirs.remove(d)   # inutile de descendre plus loin
+                        continue
+
+                    # 2. github.copilot* dans un dossier extensions VS Code
+                    if d.startswith("github.copilot") and parent_name == "extensions":
+                        _write("GitHub Copilot", full_d)
+                        continue
+
+                    # 3. Nom d'app sous un parent "appdata"
+                    if d in _IA_APPDATA_NAMES and parent_name in _APPDATA_PARENTS:
+                        _write(_IA_APPDATA_NAMES[d], full_d)
+                        dirs.remove(d)
+                        continue
+
+                # ── Détection sur les fichiers ────────────────────────────
+                for f in files:
+                    if f in _IA_FILE_NAMES:
+                        _write(_IA_FILE_NAMES[f], os.path.join(root, f))
+
+        if counter >= 1:
+            print(green(f"[+] IA apps artifacts written into {output_file} ({counter} entries)"))
+        else:
+            print(yellow(f"No IA apps artifacts found, {output_file} should be empty"))
+
+    except Exception as e:
+        print(red(f"[-] Error writing IA apps info: {e}"))
+
+
+def _mount_vhdx(vhdx_path):
+    """Copy vhdx_path to /tmp (sparse), connect via qemu-nbd, mount read-only.
+    Returns (mount_point, nbd_dev, tmp_vhdx) on success, (None, None, None) on failure."""
+    try:
+        r = subprocess.run(["qemu-nbd", "--version"], capture_output=True)
+        if r.returncode != 0:
+            print(yellow(f"[!] qemu-nbd not available, skipping VHDX mount: {vhdx_path}"))
+            return None, None, None
+    except Exception:
+        print(yellow(f"[!] qemu-nbd not found (install qemu-utils), skipping: {vhdx_path}"))
+        return None, None, None
+    base        = os.path.basename(vhdx_path)
+    tmp_vhdx    = f"/tmp/mat_vhdx_{os.getpid()}_{base}"
+    mount_point = f"/tmp/mat_mnt_{os.getpid()}_{base}"
+    nbd_dev     = None
+    try:
+        print(yellow(f"[!] Copying {base} to /tmp (sparse)..."))
+        r_cp = subprocess.run(
+            ["cp", "--sparse=always", vhdx_path, tmp_vhdx],
+            capture_output=True, timeout=600
+        )
+        if r_cp.returncode != 0:
+            print(red(f"[-] Copy failed: {r_cp.stderr.decode(errors='replace').strip()}"))
+            return None, None, None
+        subprocess.run(["modprobe", "nbd", "max_part=8"], capture_output=True)
+        time.sleep(0.5)
+        os.makedirs(mount_point, exist_ok=True)
+        for i in range(16):
+            candidate = f"/dev/nbd{i}"
+            if not os.path.exists(candidate):
+                continue
+            r = subprocess.run(
+                ["qemu-nbd", f"--connect={candidate}", tmp_vhdx],
+                capture_output=True, timeout=30
+            )
+            if r.returncode == 0:
+                nbd_dev = candidate
+                break
+        if nbd_dev is None:
+            print(red(f"[-] Could not connect {base} to any /dev/nbd device"))
+            os.remove(tmp_vhdx)
+            os.rmdir(mount_point)
+            return None, None, None
+        print(yellow(f"[!] Mounting {base} via {nbd_dev}..."))
+        time.sleep(1)
+        for dev in (nbd_dev, f"{nbd_dev}p1"):
+            r2 = subprocess.run(
+                ["mount", "-o", "ro", dev, mount_point],
+                capture_output=True, timeout=15
+            )
+            if r2.returncode == 0:
+                print(green(f"[+] {base} mounted at {mount_point}"))
+                return mount_point, nbd_dev, tmp_vhdx
+        print(red(f"[-] mount failed for {base}: {r2.stderr.decode(errors='replace').strip()}"))
+        subprocess.run(["qemu-nbd", "--disconnect", nbd_dev], capture_output=True, timeout=15)
+        os.remove(tmp_vhdx)
+        try:
+            os.rmdir(mount_point)
+        except Exception:
+            pass
+        return None, None, None
+    except Exception as e:
+        print(red(f"[-] Error mounting VHDX {vhdx_path}: {e}"))
+        try:
+            if nbd_dev:
+                subprocess.run(["qemu-nbd", "--disconnect", nbd_dev], capture_output=True, timeout=15)
+            if os.path.exists(tmp_vhdx):
+                os.remove(tmp_vhdx)
+            if os.path.isdir(mount_point):
+                os.rmdir(mount_point)
+        except Exception:
+            pass
+        return None, None, None
+
+
+def _umount_vhdx(mount_point, nbd_dev, tmp_vhdx=None):
+    try:
+        subprocess.run(["umount", mount_point], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["qemu-nbd", "--disconnect", nbd_dev], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    try:
+        os.rmdir(mount_point)
+    except Exception:
+        pass
+    if tmp_vhdx:
+        try:
+            os.remove(tmp_vhdx)
+        except Exception:
+            pass
+
+
+
+def get_windows_docker_wsl(mount_path, computer_name):
+    output_file = os.path.join(script_path, result_folder, "windows_docker_wsl.csv")
+    csv_columns = [
+        'computer_name', 'type', 'container_name', 'container_state',
+        'container_ip', 'exposed_ports', 'volumes', 'container_logs',
+        'overlay_directory', 'image_url', 'build_time', 'artifact_path',
+    ]
+    print(yellow("[!] Retrieving Docker Desktop / WSL docker information..."))
 
     try:
         counter = 0
@@ -2111,79 +2302,230 @@ def get_linux_docker(mount_path, computer_name):
             writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
             writer.writeheader()
 
-            if not os.path.exists(docker_containers_dir):
-                print(yellow(f"No dockers data found, {output_file} should be empty"))
-                return
-            for container_id in os.listdir(docker_containers_dir):
-                container_path = os.path.join(docker_containers_dir, container_id)
-                config_path = os.path.join(container_path, "config.v2.json")
-                if not os.path.isfile(config_path):
-                    continue
+            def _write_row(type_, artifact_path, container_name="", container_state="",
+                           container_ip="", exposed_ports="", volumes="",
+                           container_logs="", overlay_directory="",
+                           image_url="", build_time=""):
+                nonlocal counter
+                writer.writerow({
+                    "computer_name":     computer_name,
+                    "type":              type_,
+                    "container_name":    container_name,
+                    "container_state":   container_state,
+                    "container_ip":      container_ip,
+                    "exposed_ports":     exposed_ports,
+                    "volumes":           volumes,
+                    "container_logs":    container_logs,
+                    "overlay_directory": overlay_directory,
+                    "image_url":         image_url,
+                    "build_time":        build_time,
+                    "artifact_path":     artifact_path,
+                })
+                counter += 1
 
+            # ── 1. Windows native Docker containers (ProgramData\Docker\containers\) ──
+            win_containers_dir = os.path.join(mount_path, "ProgramData", "Docker", "containers")
+            win_buildkit_db    = os.path.join(mount_path, "ProgramData", "Docker", "buildkit", "metadata_v2.db")
+
+            win_metadata = {}
+            try:
+                if os.path.exists(win_buildkit_db):
+                    print(f" Docker native mode found.")
+                    with open(win_buildkit_db, "rb") as f:
+                        raw = f.read()
+                    content  = raw.decode("latin-1")
+                    desc_re  = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
+                    diff_re  = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
+                    ts_re    = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
+                    WINDOW   = 3000
+                    for m in desc_re.finditer(content):
+                        try:
+                            url     = m.group(1)
+                            pos     = m.start()
+                            segment = content[max(0, pos - WINDOW) : pos + WINDOW]
+                            diff_m  = diff_re.search(segment)
+                            if not diff_m:
+                                continue
+                            diff_id   = diff_m.group(1)
+                            pull_time = ""
+                            ts_m = ts_re.search(segment)
+                            if ts_m:
+                                try:
+                                    ns = int(ts_m.group(1))
+                                    pull_time = (
+                                        datetime(1970, 1, 1) + timedelta(seconds=ns / 1e9)
+                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                except Exception:
+                                    pass
+                            win_metadata[diff_id] = {"url": url, "pull_time": pull_time}
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            if os.path.isdir(win_containers_dir):
                 try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                    for container_id in os.listdir(win_containers_dir):
+                        container_path = os.path.join(win_containers_dir, container_id)
+                        config_path    = os.path.join(container_path, "config.v2.json")
+                        if not os.path.isfile(config_path):
+                            continue
+                        try:
+                            with open(config_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            container_name  = data.get("Name", "").lstrip("/")
+                            container_state = data.get("State", {}).get("Running", "")
+                            container_ip    = ""
+                            networks = data.get("NetworkSettings", {}).get("Networks", {})
+                            for net_data in networks.values():
+                                ip = net_data.get("IPAddress")
+                                if ip:
+                                    container_ip = ip
+                                    break
+                            container_ports = ",".join(
+                                data.get("Config", {}).get("ExposedPorts", {}).keys()
+                            ) if data.get("Config", {}).get("ExposedPorts") else ""
+                            container_logs = data.get("LogPath", "") or ""
+                            if container_logs:
+                                container_logs = os.path.join(
+                                    mount_path, container_logs.lstrip("/\\")
+                                )
+                            mounts  = data.get("MountPoints", {})
+                            volumes = ",".join(
+                                [m.get("Source", "") for m in mounts.values() if "Source" in m]
+                            )
+                            graphdriver       = data.get("GraphDriver", {})
+                            graph_data        = graphdriver.get("Data", {})
+                            overlay_directory = graph_data.get("Dir") or graph_data.get("MergedDir") or "Unknown"
+                            image_url  = ""
+                            build_time = ""
+                            image_field = data.get("Image", "")
+                            if image_field and ":" in image_field:
+                                try:
+                                    algo, digest = image_field.split(":", 1)
+                                    for driver in ("windowsfilter", "overlay2"):
+                                        imagedb_path = os.path.join(
+                                            mount_path, "ProgramData", "Docker", "image",
+                                            driver, "imagedb", "content", algo, digest
+                                        )
+                                        if os.path.exists(imagedb_path):
+                                            with open(imagedb_path, "r", encoding="utf-8") as f:
+                                                img_data = json.load(f)
+                                            build_time = img_data.get("created", "")
+                                            for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
+                                                if diff_id in win_metadata:
+                                                    image_url = win_metadata[diff_id]["url"]
+                                                    break
+                                            break
+                                except Exception:
+                                    pass
+                            _write_row(
+                                type_="windows_container",
+                                artifact_path=config_path,
+                                container_name=container_name,
+                                container_state=container_state,
+                                container_ip=container_ip,
+                                exposed_ports=container_ports,
+                                volumes=volumes,
+                                container_logs=container_logs,
+                                overlay_directory=overlay_directory,
+                                image_url=image_url,
+                                build_time=build_time,
+                            )
+                        except Exception as e:
+                            print(red(f"[-] Error processing Windows container {container_id}: {e}"))
+                except Exception:
+                    pass
 
-                    container_name = data.get("Name", "").lstrip("/")
-                    container_state = data.get("State", {}).get("Running", "")
-                    container_ip = ""
-                    networks = data.get("NetworkSettings", {}).get("Networks", {})
-                    for net_data in networks.values():
-                        ip = net_data.get("IPAddress")
-                        if ip:
-                            container_ip = ip
-                            break
-                    container_ports = ",".join(data.get("Config", {}).get("ExposedPorts", {}).keys()) if data.get("Config", {}).get("ExposedPorts") else ""
-                    container_logs = data.get("LogPath", {}) if data.get("LogPath") else ""
-                    if container_logs:
-                        container_logs = os.path.join(mount_path, container_logs)
-                    mounts = data.get("MountPoints", {})
-                    volumes = ",".join([m.get("Source", "") for m in mounts.values() if "Source" in m])
-                    # Extraction du répertoire overlay
-                    overlay_directory = ""
-                    graphdriver = data.get("GraphDriver", {})
-                    graph_data = graphdriver.get("Data", {})
-                    merged_dir = graph_data.get("MergedDir", "")
-                    if merged_dir:
-                        # Si le path commence par /var/lib/docker, le remplacer par mount_path
-                        if merged_dir.startswith("/var/lib/docker"):
-                            overlay_directory = os.path.join(mount_path, merged_dir.lstrip("/"))
-                        else:
-                            overlay_directory = merged_dir
-                    else:
-                        overlay_directory = "Unknown"
+            # ── 2. Docker Desktop WSL2 + WSL distros (per user) ─────────────────────
+            users_dir = os.path.join(mount_path, "Users")
+            if os.path.isdir(users_dir):
+                print(f" Docker WSL mode found.")
+                try:
+                    for username in os.listdir(users_dir):
+                        user_path = os.path.join(users_dir, username)
+                        if not os.path.isdir(user_path):
+                            continue
 
-                    # ── image_url (metadata_v2.db → diff_ids) & build_time (imagedb) ──
-                    image_url, build_time = _get_image_info(
-                        mount_path, data.get("Image", ""), metadata_v2
-                    )
+                        # AppData\Local\Docker\ — Docker Desktop WSL2 data disks (ext4.vhdx)
+                        docker_local = os.path.join(user_path, "AppData", "Local", "Docker")
+                        if os.path.isdir(docker_local):
+                            try:
+                                for subroot, _, subfiles in os.walk(docker_local, onerror=lambda e: None):
+                                    for fname in subfiles:
+                                        if fname.lower().endswith(".vhdx"):
+                                            vhdx = os.path.join(subroot, fname)
+                                            _write_row(type_="docker_desktop_wsl", artifact_path=vhdx)
+                                            vhdx_mount, nbd_dev, tmp_vhdx = _mount_vhdx(vhdx)
+                                            if vhdx_mount:
+                                                try:
+                                                    for row in _collect_docker_containers(vhdx_mount, computer_name):
+                                                        row["type"]          = "docker_desktop_container"
+                                                        row["artifact_path"] = vhdx
+                                                        writer.writerow(row)
+                                                        counter += 1
+                                                finally:
+                                                    _umount_vhdx(vhdx_mount, nbd_dev, tmp_vhdx)
+                            except Exception:
+                                pass
 
-                    writer.writerow({
-                        "computer_name": computer_name,
-                        "container_name": container_name,
-                        "container_state": container_state,
-                        "container_ip": container_ip,
-                        "exposed_ports": container_ports,
-                        "volumes": volumes,
-                        "container_logs": container_logs,
-                        "overlay_directory": overlay_directory,
-                        "image_url": image_url,
-                        "build_time": build_time,
-                    })
-                    counter += 1
+                        # AppData\Roaming\Docker\ — Docker Desktop settings / daemon config
+                        docker_roaming = os.path.join(user_path, "AppData", "Roaming", "Docker")
+                        if os.path.isdir(docker_roaming):
+                            try:
+                                for cfg_file in ("settings.json", "settings-store.json", "daemon.json"):
+                                    cfg_path = os.path.join(docker_roaming, cfg_file)
+                                    if os.path.isfile(cfg_path):
+                                        _write_row(type_="docker_desktop_config", artifact_path=cfg_path)
+                            except Exception:
+                                pass
 
-                except Exception as e:
-                    print(red(f"[-] Error processing container {container_id}: {e}"))
-            if counter >= 1:
-                print(green(f"Dockers data has been written into {output_file}"))
-            else:
-                print(yellow(f"No dockers data found, {output_file} should be empty"))
+                        # .docker\config.json — Docker CLI credentials / config
+                        docker_cli = os.path.join(user_path, ".docker", "config.json")
+                        if os.path.isfile(docker_cli):
+                            try:
+                                _write_row(type_="docker_cli_config", artifact_path=docker_cli)
+                            except Exception:
+                                pass
 
+                        # AppData\Local\Packages\<distro>\LocalState\*.vhdx — WSL distro disks
+                        packages_dir = os.path.join(user_path, "AppData", "Local", "Packages")
+                        if os.path.isdir(packages_dir):
+                            try:
+                                for pkg_name in os.listdir(packages_dir):
+                                    local_state = os.path.join(packages_dir, pkg_name, "LocalState")
+                                    if not os.path.isdir(local_state):
+                                        continue
+                                    try:
+                                        for fname in os.listdir(local_state):
+                                            if fname.lower().endswith(".vhdx"):
+                                                vhdx = os.path.join(local_state, fname)
+                                                _write_row(type_="wsl_distro", artifact_path=vhdx)
+                                                vhdx_mount, nbd_dev, tmp_vhdx = _mount_vhdx(vhdx)
+                                                if vhdx_mount:
+                                                    try:
+                                                        for row in _collect_docker_containers(vhdx_mount, computer_name):
+                                                            row["type"]          = "wsl_container"
+                                                            row["artifact_path"] = vhdx
+                                                            writer.writerow(row)
+                                                            counter += 1
+                                                    finally:
+                                                        _umount_vhdx(vhdx_mount, nbd_dev, tmp_vhdx)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        if counter >= 1:
+            print(green(f"[+] Docker Desktop / WSL data has been written into {output_file} ({counter} entries)"))
+        else:
+            print(yellow(f"No Docker Desktop / WSL data found, {output_file} should be empty"))
 
     except Exception as e:
-        print(red(f"[-] Error writing Docker info: {e}"))
+        print(red(f"[-] Error writing Docker Desktop / WSL info: {e}"))
 
-    
 
 def get_windows_machine_name(mount_path):
     #chaine = "Informations du système Windows"
@@ -3520,14 +3862,14 @@ def hayabusa_evtx(mount_path, computer_name):
         # Demander le nom du fichier de sortie
         if os.path.exists(hayabusa_path):
             output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.csv"
-            json_output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.jsonl"
+            #json_output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.jsonl"
             print("[+] Launching Hayabusa...")
             command = f"{hayabusa_path} csv-timeline -C -d {mount_path}/Windows/System32/winevt/Logs/ -T -o {output_file}"
             #command = f"{hayabusa_path} json-timeline -C -N -a -w -d {mount_path}/Windows/System32/winevt/Logs/ -L -o {json_output_file}"
             os.system(command)
             df = pd.read_csv(output_file)
             df['Computer'] = computer_name
-            df.to_csv(output_file, index=False)
+            df.to_csv(output_file, index=False, quoting=csv.QUOTE_ALL)
 
         else:
             print(f"[-] Hayabusa executable has to be in {script_path} folder.")
@@ -4403,23 +4745,12 @@ def process_crypto_chunk(chunk, computer_name, files_to_search, bip39_words, csv
                 continue
             if os.path.getsize(file_path) > max_file_size:
                 local_pbar.update(1)
-                continue
-            #with open("process_crypto_log.txt", "a") as log_file:
-            #    log_file.write(f"Starting analysis of {file_path}\n")
-
+                continue 
             # Check if the file matches one of the wallet names
             if file_name in files_to_search:
                 result = {"computer_name": computer_name, "type": "potential_wallet", "match": "", "source_file": file_path}
                 results.append(result)
 
-            # Check for BTC mnemonic in the file
-            '''
-            if find_btc_mnemo_in_files(file_path, bip39_words, min_matches=10):
-                found_words = find_btc_seed_in_file(file_path, bip39_words)
-                if found_words:
-                    result = {"computer_name": computer_name, "type": "potential_btc_seed", "match": found_words, "source_file": file_path}
-                    results.append(result)
-            '''
             # Analyze Yara rule for the file
             entries = analyze_yara(computer_name, file_path, rule)
             if entries:
@@ -4450,7 +4781,7 @@ def crypto_search(computer_name, mount_path, threads_number):
     print(yellow(f"[!] Looking now for crypto elements"))
     output_file = f"{script_path}/{result_folder}/crypto.csv"
     files_to_search = [
-        "wallet.dat", "electrum.dat", "default_wallet", "keystore", "wallet.json", "exodus.*",
+        "wallet.dat", "electrum.dat", "default_wallet", "keystore", "wallet.json", "seed.seco",
         "UTC--", "blockchain_wallet", "keyfile", "bitcoincash.dat", "monero-wallet.dat"
     ]
     ## ici, ça passe au scan yara "crypto"
@@ -6083,10 +6414,10 @@ if len(sys.argv) > 1:
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)
             get_linux_crontab(mount_path, computer_name)
-            #create_volatility_profile(mount_path)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
+            get_ia_apps(mount_path, computer_name)
         elif platform == "Windows":
             computer_name = get_windows_machine_name(mount_path)
             if image_path:
@@ -6111,6 +6442,8 @@ if len(sys.argv) > 1:
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
+            get_windows_docker_wsl(mount_path, computer_name)
+            get_ia_apps(mount_path, computer_name)
         elif platform == "macOS":
             mac_root = os.path.join(mount_path, 'root')
             mac_private = os.path.join(mount_path, 'private-dir')
@@ -6129,6 +6462,7 @@ if len(sys.argv) > 1:
             get_files_of_interest(mac_root, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mac_root)
             get_instant_messaging(computer_name, mac_root)
+            get_ia_apps(computer_name, mac_root)
         else:
             print(yellow("[!] Unknown OS"))
             if automate:
