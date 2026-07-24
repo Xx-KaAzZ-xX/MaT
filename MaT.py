@@ -1120,120 +1120,329 @@ def list_services(mount_path, computer_name):
         print(yellow("System is not managed by Systemd"))
 
 
+def _parse_zsh_history(hist_file):
+    """
+    Parse a .zsh_history file, handling the EXTENDED_HISTORY format
+    (': <epoch>:<elapsed>;<command>') and backslash-continued multi-line
+    commands. Yields (timestamp, command) tuples; timestamp is "" when the
+    line is not in extended-history format (SHARE_HISTORY/EXTENDED_HISTORY
+    disabled).
+    """
+    pending_command = None
+    pending_timestamp = ""
+    for raw_line in hist_file:
+        line = raw_line.rstrip("\n")
+        if pending_command is not None:
+            pending_command += "\n" + line
+        else:
+            m = re.match(r'^: (\d+):(\d+);(.*)$', line)
+            if m:
+                pending_timestamp = m.group(1)
+                pending_command = m.group(3)
+            else:
+                pending_timestamp = ""
+                pending_command = line
+
+        if pending_command.endswith("\\"):
+            pending_command = pending_command[:-1]
+            continue
+
+        yield pending_timestamp, pending_command
+        pending_command = None
+        pending_timestamp = ""
+
+    if pending_command is not None:
+        yield pending_timestamp, pending_command
+
+
 def get_command_history(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_command_history.csv")
     print(yellow("[!] Retrieving command history ..."))
-    csv_columns = ['computer_name', 'user', 'shell', 'command']
-    
+    csv_columns = ['computer_name', 'user', 'shell', 'timestamp', 'command']
+
     try:
         with open(output_file, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=csv_columns)
             writer.writeheader()
-            
+
             # Rechercher tous les dossiers "home" pour les utilisateurs
             home_dirs = glob.glob(os.path.join(mount_path, "home", "*"))
             home_dirs.append(os.path.join(mount_path, "root"))
 
-            
+
             for home_dir in home_dirs:
                 user = os.path.basename(home_dir)
                 # Vérifier les fichiers d'historique de commandes
                 for shell_history_file in ['.bash_history', '.zsh_history', '.sh_history']:
                     history_file_path = os.path.join(home_dir, shell_history_file)
                     shell = shell_history_file.replace("_history", "").replace(".", "")
-                    
+
                     if os.path.exists(history_file_path):
                         try:
                             with open(history_file_path, 'r', encoding='utf-8', errors='ignore') as hist_file:
-                                for command in hist_file:
-                                    command = command.strip()
-                                    if command:
+                                if shell == "zsh":
+                                    for raw_timestamp, command in _parse_zsh_history(hist_file):
+                                        command = command.strip()
+                                        if not command:
+                                            continue
+                                        timestamp = ""
+                                        if raw_timestamp:
+                                            try:
+                                                timestamp = datetime.utcfromtimestamp(int(raw_timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+                                            except (ValueError, OverflowError, OSError):
+                                                timestamp = ""
                                         writer.writerow({
                                             'computer_name': computer_name,
                                             'user': user,
                                             'shell': shell,
+                                            'timestamp': timestamp,
                                             'command': command
                                         })
+                                else:
+                                    for command in hist_file:
+                                        command = command.strip()
+                                        if command:
+                                            writer.writerow({
+                                                'computer_name': computer_name,
+                                                'user': user,
+                                                'shell': shell,
+                                                'timestamp': '',
+                                                'command': command
+                                            })
                         except Exception as file_error:
                             print(red(f"[-] Error reading {history_file_path}: {file_error}"))
-    
+
     except Exception as e:
         print(red(f"[-] Error retrieving command history: {e}"))
-    
+
     print(green(f"Command history has been written into {output_file}"))
+
+
+def _parse_iptables_save_file(path, firewall_label, computer_name, mount_path, rules):
+    """Parse an iptables-save format file (UFW .rules or iptables-persistent rules.v*)."""
+    current_table = ""
+    rel_path = path.replace(mount_path, "", 1)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+
+                if line.startswith("*"):
+                    current_table = line[1:]
+                    continue
+
+                # Chain default policy: ":INPUT ACCEPT [0:0]"
+                if line.startswith(":") and not line.startswith("::"):
+                    parts = line[1:].split()
+                    if len(parts) >= 2 and parts[1] not in ("-",):
+                        rules.append({
+                            "computer_name": computer_name,
+                            "firewall": firewall_label,
+                            "source_file": rel_path,
+                            "table": current_table,
+                            "chain": parts[0],
+                            "protocol": "",
+                            "policy": parts[1],
+                            "src_ip": "",
+                            "src_port": "",
+                            "dest_ip": "",
+                            "dest_port": "",
+                            "raw_rule": line,
+                        })
+                    continue
+
+                if not line.startswith("-A"):
+                    continue
+
+                chain   = re.search(r"-A (\S+)", line)
+                proto   = re.search(r"-p (\S+)", line)
+                policy  = re.search(r"-j (\S+)", line)
+                src_ip  = re.search(r"-s (\S+)", line)
+                dest_ip = re.search(r"-d (\S+)", line)
+                sport   = re.search(r"--sport (\S+)", line)
+                dport   = re.search(r"--dport (\S+)", line)
+
+                rules.append({
+                    "computer_name": computer_name,
+                    "firewall": firewall_label,
+                    "source_file": rel_path,
+                    "table": current_table,
+                    "chain":    chain.group(1)   if chain   else "",
+                    "protocol": proto.group(1)   if proto   else "",
+                    "policy":   policy.group(1)  if policy  else "",
+                    "src_ip":   src_ip.group(1)  if src_ip  else "",
+                    "src_port": sport.group(1)   if sport   else "",
+                    "dest_ip":  dest_ip.group(1) if dest_ip else "",
+                    "dest_port": dport.group(1)  if dport   else "",
+                    "raw_rule": line,
+                })
+    except Exception as e:
+        print(yellow(f"[!] Error reading {path}: {e}"))
+
+
+def _parse_nftables_file(path, computer_name, mount_path, rules, _visited=None):
+    """Best-effort parse of an nftables config file, following include directives."""
+    if _visited is None:
+        _visited = set()
+    real = os.path.realpath(path)
+    if real in _visited:
+        return
+    _visited.add(real)
+
+    current_table = ""
+    current_chain = ""
+    brace_depth = 0
+    rel_path = path.replace(mount_path, "", 1)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line_s = line.strip()
+
+                if not line_s or line_s.startswith("#") or line_s.startswith("flush") or line_s.startswith("#!/"):
+                    continue
+
+                # include "/etc/nftables/*.nft"
+                include_m = re.match(r'^include\s+"([^"]+)"', line_s)
+                if include_m:
+                    pattern = include_m.group(1)
+                    if pattern.startswith("/"):
+                        abs_pattern = mount_path.rstrip("/") + pattern
+                    else:
+                        abs_pattern = os.path.join(os.path.dirname(path), pattern)
+                    for inc in sorted(glob.glob(abs_pattern)):
+                        print(yellow(f"[*] Parsing nftables include: {inc.replace(mount_path, '', 1)}"))
+                        _parse_nftables_file(inc, computer_name, mount_path, rules, _visited)
+                    continue
+
+                # Table: "table inet filter {"
+                table_m = re.match(r"^table\s+(\S+)\s+(\S+)", line_s)
+                if table_m:
+                    current_table = f"{table_m.group(1)} {table_m.group(2)}"
+                    current_chain = ""
+                    brace_depth = 0
+                    continue
+
+                # Chain: "chain input {"
+                chain_m = re.match(r"^chain\s+(\S+)", line_s)
+                if chain_m:
+                    current_chain = chain_m.group(1)
+                    brace_depth = 1
+                    continue
+
+                # Closing braces
+                if line_s == "}":
+                    if brace_depth > 0:
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            current_chain = ""
+                    else:
+                        current_table = ""
+                    continue
+
+                # Default chain policy: "type filter hook input priority filter; policy drop;"
+                if line_s.startswith("type ") and current_chain:
+                    policy_m = re.search(r"policy\s+(accept|drop|reject|continue|return)", line_s, re.I)
+                    if policy_m:
+                        rules.append({
+                            "computer_name": computer_name,
+                            "firewall": "nftables",
+                            "source_file": rel_path,
+                            "table": current_table,
+                            "chain": current_chain,
+                            "protocol": "",
+                            "policy": policy_m.group(1).lower(),
+                            "src_ip": "",
+                            "src_port": "",
+                            "dest_ip": "",
+                            "dest_port": "",
+                            "raw_rule": line_s,
+                        })
+                    continue
+
+                if not current_chain:
+                    continue
+
+                src_ip   = re.search(r"ip6?\s+saddr\s+(\S+)", line_s)
+                dest_ip  = re.search(r"ip6?\s+daddr\s+(\S+)", line_s)
+                proto    = re.search(r"\b(tcp|udp|icmp|icmpv6|sctp)\b", line_s)
+                dport    = re.search(r"(?:tcp|udp)\s+dport\s+(\S+)", line_s)
+                sport    = re.search(r"(?:tcp|udp)\s+sport\s+(\S+)", line_s)
+                verdict  = re.search(r"\b(accept|drop|reject|return|jump\s+\S+|goto\s+\S+)\b", line_s, re.I)
+
+                rules.append({
+                    "computer_name": computer_name,
+                    "firewall": "nftables",
+                    "source_file": rel_path,
+                    "table": current_table,
+                    "chain": current_chain,
+                    "protocol": proto.group(1)   if proto   else "",
+                    "policy":   verdict.group(1) if verdict else "",
+                    "src_ip":   src_ip.group(1)  if src_ip  else "",
+                    "src_port": sport.group(1)   if sport   else "",
+                    "dest_ip":  dest_ip.group(1) if dest_ip else "",
+                    "dest_port": dport.group(1)  if dport   else "",
+                    "raw_rule": line_s,
+                })
+    except Exception as e:
+        print(yellow(f"[!] Error reading {path}: {e}"))
 
 
 def get_firewall_rules(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_firewall_rules.csv")
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-    csv_columns = ['computer_name', 'chain', 'protocol', 'policy', 'src_ip', 'src_port', 'dest_ip', 'dest_port', 'firewall']
+    csv_columns = ['computer_name', 'firewall', 'source_file', 'table', 'chain',
+                   'protocol', 'policy', 'src_ip', 'src_port', 'dest_ip', 'dest_port', 'raw_rule']
     rules = []
+
+    # --- UFW ---
     ufw_dir = os.path.join(mount_path, "etc", "ufw")
-    counter = 0
     if os.path.isdir(ufw_dir):
-        for root, _, files in os.walk(ufw_dir):
-            for fname in files:
-                if not fname.endswith(".rules"):
-                    print(f"No UFW rules found")
-                    break
-                path = os.path.join(root, fname)
-                try:
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        for line in f:
-                            #print(f"{line}")
-                            line = line.strip()
-                            if not line.startswith("-A"):
-                                continue
-    
-                            chain = re.search(r"-A (\S+)", line)
-                            #print(f"{chain.group(1)}")
-                            protocol = re.search(r"-p (\S+)", line)
-                            policy = re.search(r"-j (\S+)", line)
-                            #print(f"{policy.group(1)}")
-                            src_ip = re.search(r"-s (\S+)", line)
-                            dest_ip = re.search(r"-d (\S+)", line)
-                            src_port = re.search(r"--sport (\d+)", line)
-                            dport = re.search(r"--dport (\d+)", line)
-    
-                            rules.append({
-                                "computer_name": computer_name,
-                                "chain": chain.group(1) if chain else "",
-                                "protocol": protocol.group(1) if protocol else "",
-                                "policy": policy.group(1) if policy else "",
-                                "src_ip": src_ip.group(1) if src_ip else "",
-                                "src_port": src_port.group(1) if src_port else "",
-                                "dest_ip": dest_ip.group(1) if dest_ip else "",
-                                "dest_port": dport.group(1) if dport else "",
-                                "firewall": "ufw"
-                            })
-                except Exception as e:
-                    #print(red(f"Error : {e}"))
-                    continue
-    
-        if rules:
-            #print(f"{rules}")
-            with open(output_file, mode='w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=csv_columns)
-                writer.writeheader()
-                writer.writerows(rules)
-        # Only keep rows with IP or Port defined
-            try:
-                df = pd.read_csv(output_file)
-                df_filtered = df[
-                    (df['src_ip'].notna() & (df['src_ip'] != "")) |
-                    (df['dest_ip'].notna() & (df['dest_ip'] != "")) |
-                    (df['src_port'].notna() & (df['src_port'] != "")) |
-                    (df['dest_port'].notna() & (df['dest_port'] != ""))
-                ]
-                df_filtered = df_filtered.drop_duplicates()
-                df_filtered.to_csv(output_file, index=False)
-            except:
-                pass
-    if counter > 1:
-        print(green(f"Firewall rules has been written into {output_file}"))
+        for fname in os.listdir(ufw_dir):
+            if fname.endswith(".rules"):
+                path = os.path.join(ufw_dir, fname)
+                print(yellow(f"[*] Parsing UFW: {fname}"))
+                _parse_iptables_save_file(path, "ufw", computer_name, mount_path, rules)
+
+    # --- iptables-persistent (Debian/Ubuntu) and sysconfig (RHEL/CentOS) ---
+    iptables_candidates = [
+        ("etc/iptables/rules.v4", "iptables"),
+        ("etc/iptables/rules.v6", "ip6tables"),
+        ("etc/sysconfig/iptables", "iptables"),
+        ("etc/sysconfig/ip6tables", "ip6tables"),
+    ]
+    for rel, label in iptables_candidates:
+        path = os.path.join(mount_path, rel)
+        if os.path.isfile(path):
+            print(yellow(f"[*] Parsing iptables-persistent: {rel}"))
+            _parse_iptables_save_file(path, label, computer_name, mount_path, rules)
+
+    # --- nftables ---
+    # Entry points: main config + drop-in directories (include resolution handles the rest)
+    nft_visited = set()
+    nft_entry_points = []
+    for candidate in ["etc/nftables.conf", "etc/nftables/main.nft"]:
+        p = os.path.join(mount_path, candidate)
+        if os.path.isfile(p):
+            nft_entry_points.append(p)
+    for nft_dir_name in ["etc/nftables.conf.d", "etc/nftables"]:
+        nft_dir = os.path.join(mount_path, nft_dir_name)
+        if os.path.isdir(nft_dir):
+            for fname in sorted(os.listdir(nft_dir)):
+                if fname.endswith(".conf") or fname.endswith(".nft"):
+                    nft_entry_points.append(os.path.join(nft_dir, fname))
+    for path in nft_entry_points:
+        print(yellow(f"[*] Parsing nftables: {path.replace(mount_path, '', 1)}"))
+        _parse_nftables_file(path, computer_name, mount_path, rules, nft_visited)
+
+    if rules:
+        with open(output_file, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(rules)
+        print(green(f"[+] {len(rules)} firewall rules written to {output_file}"))
     else:
-        print(yellow(f"No firewall rules found. {output_file} should be empty"))
+        print(yellow(f"[!] No persistent firewall rules found."))
     
 
 
@@ -4731,47 +4940,48 @@ def process_crypto_chunk(chunk, computer_name, files_to_search, bip39_words, csv
     local_pbar = tqdm(
         total=len(chunk), desc=f"Thread {thread_id}", position=thread_id, unit="file"
     )
+    rule = "yara/crypto_rule.yar"
+    max_file_size = 5 * 1024 * 1024 * 1024  # Limit analysis to 5Go
+
     try:
-        rule = "yara/crypto_rule.yar"
-        max_file_size = 5 * 1024 * 1024 * 1024  # Limit analysis to 5Go
-
         for file_path in chunk:
-            results = []
-            file_name = file_path.split("/")[-1]
-            
-            # Exclude certain paths
-            if "/usr/" in file_path or "/doc/" in file_path or "/snap/" in file_path or "/proc" in file_path or "/sys/" in file_path:
-                local_pbar.update(1)
-                continue
-            if os.path.getsize(file_path) > max_file_size:
-                local_pbar.update(1)
-                continue 
-            # Check if the file matches one of the wallet names
-            if file_name in files_to_search:
-                result = {"computer_name": computer_name, "type": "potential_wallet", "match": "", "source_file": file_path}
-                results.append(result)
+            try:
+                results = []
+                file_name = file_path.split("/")[-1]
 
-            # Analyze Yara rule for the file
-            entries = analyze_yara(computer_name, file_path, rule)
-            if entries:
-                for entry in entries:
-                    result = {
-                        "computer_name": entry["computer_name"],
-                        "type": entry["type"],
-                        "match": entry["match"],
-                        "source_file": entry["source_file"]
-                    }
+                # Exclude certain paths
+                if "/usr/" in file_path or "/doc/" in file_path or "/snap/" in file_path or "/proc" in file_path or "/sys/" in file_path:
+                    continue
+                if os.path.getsize(file_path) > max_file_size:
+                    continue
+                # Check if the file matches one of the wallet names
+                if file_name in files_to_search:
+                    result = {"computer_name": computer_name, "type": "potential_wallet", "match": "", "source_file": file_path}
                     results.append(result)
 
-            # Write results to the queue
-            for res in results:
-                csv_queue.put(res)
+                # Analyze Yara rule for the file
+                entries = analyze_yara(computer_name, file_path, rule)
+                if entries:
+                    for entry in entries:
+                        result = {
+                            "computer_name": entry["computer_name"],
+                            "type": entry["type"],
+                            "match": entry["match"],
+                            "source_file": entry["source_file"]
+                        }
+                        results.append(result)
 
-            # Update progress bar
-            local_pbar.update(1)
+                # Write results to the queue
+                for res in results:
+                    csv_queue.put(res)
+
+            except Exception as e:
+                print(red(f"[-] Error processing '{file_path}' in thread {thread_id}: {e}"))
+            finally:
+                local_pbar.update(1)
 
     except Exception as e:
-        print(f"[-] Error in thread {thread_id}: {e}")
+        print(red(f"[-] Error in thread {thread_id}: {e}"))
     finally:
         local_pbar.close()
 
@@ -6051,6 +6261,30 @@ def get_mft(computer_name, image_path, byte_offset):
     except Exception as e:
         print(red(f"[-] Error extracting or parsing MFT: {e}"))
 
+def detect_format_by_magic(path):
+    """
+    Identify disk image format from magic bytes.
+    Returns one of: 'qcow2', 'e01', 'vmdk', 'vdi', 'raw', or None if unreadable.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(512)
+    except Exception:
+        return None
+
+    if header[:4] == b"QFI\xfb":
+        return "qcow2"
+    if header[:3] == b"EVF":
+        return "e01"
+    if header[:4] in (b"KDMV", b"COWD"):
+        return "vmdk"
+    if len(header) >= 0x44 and header[0x40:0x44] == b"\x7f\x10\xda\xbe":
+        return "vdi"
+    if len(header) >= 512 and header[510:512] == b"\x55\xaa":
+        return "raw"
+    return "raw"
+
+
 def auto_select_partition(partitions, real_image):
     """
     Hybrid auto-selection of the OS partition:
@@ -6174,6 +6408,303 @@ def auto_select_partition(partitions, real_image):
     return best_i
 
 
+def check_dmg_prerequisites():
+    """
+    Verify that the tools required to process .dmg images are present:
+    dmg2img (dmg -> raw img conversion), apfs-fuse + apfsutil (APFS volumes),
+    and hfsplus kernel filesystem support (older, pre-APFS dmg images).
+    Prints install instructions and returns False if something is missing.
+    """
+    missing = [tool for tool in ("dmg2img", "apfs-fuse", "apfsutil") if shutil.which(tool) is None]
+
+    hfsplus_ok = True
+    try:
+        with open("/proc/filesystems") as f:
+            hfsplus_ok = "hfsplus" in f.read()
+    except Exception:
+        hfsplus_ok = True  # can't verify from here, don't block on it
+
+    if not hfsplus_ok:
+        subprocess.run(["modprobe", "hfsplus"], capture_output=True)
+        try:
+            with open("/proc/filesystems") as f:
+                hfsplus_ok = "hfsplus" in f.read()
+        except Exception:
+            hfsplus_ok = True
+
+    if missing or not hfsplus_ok:
+        print(red("[-] Missing prerequisites for .dmg processing:"))
+        if missing:
+            print(red(f"    Missing tool(s): {', '.join(missing)}"))
+        if not hfsplus_ok:
+            print(red("    hfsplus kernel filesystem support unavailable (modprobe hfsplus failed)"))
+        print(yellow(
+            "\n[!] Install with:\n"
+            "    apt update\n"
+            "    apt install -y cmake libfuse3-dev git build-essential libbz2-dev pkg-config dmg2img hfsplus hfsprogs\n\n"
+            "    git clone https://github.com/sgan81/apfs-fuse.git\n"
+            "    cd apfs-fuse\n"
+            "    git submodule init\n"
+            "    git submodule update\n"
+            "    mkdir build && cd build\n"
+            "    cmake ..\n"
+            "    make\n"
+            "    ln -s $(pwd)/apfs-fuse /usr/bin/\n"
+            "    ln -s $(pwd)/apfsutil /usr/bin/\n"
+            "    ln -s $(pwd)/apfs-dump-quick /usr/bin/\n"
+        ))
+        return False
+    return True
+
+
+def detect_dmg_fs_type(img_path):
+    """
+    Inspect a raw .img (converted from a .dmg by dmg2img) and identify its
+    filesystem: 'apfs' (APFS container, possibly behind a partition table),
+    'hfsplus', or None if unrecognized.
+    """
+    try:
+        with open(img_path, "rb") as f:
+            data = f.read(2048)
+    except Exception:
+        return None
+
+    # Direct APFS container (NXSB magic at offset 0x20)
+    if data[0x20:0x24] == b"NXSB":
+        return "apfs"
+    # Direct HFS+ / HFSX volume header at offset 1024
+    if data[1024:1026] in (b"H+", b"HX"):
+        return "hfsplus"
+
+    # Partitioned image (GPT/APM): apfsutil/apfs-fuse auto-detect the APFS
+    # partition on their own, so only probe explicitly for HFS+ here via blkid.
+    try:
+        out = subprocess.check_output(["blkid", "-o", "value", "-s", "TYPE", img_path],
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+        if out == "apfs":
+            return "apfs"
+        if out in ("hfsplus", "hfs"):
+            return "hfsplus"
+    except Exception:
+        pass
+
+    # Last resort: apfsutil can find an APFS container behind a partition
+    # table on its own — ask it directly.
+    try:
+        probe = subprocess.run(["apfsutil", img_path], capture_output=True, text=True, timeout=30)
+        if "Volume " in probe.stdout:
+            return "apfs"
+    except Exception:
+        pass
+
+    return None
+
+
+def find_hfsplus_offset(img_path):
+    """
+    Locate an HFS+/HFSX volume inside img_path, either at offset 0 or within
+    a partition table (Apple Partition Map / GPT / MBR). Returns the byte
+    offset of the volume, or None if not found.
+    """
+    try:
+        with open(img_path, "rb") as f:
+            f.seek(1024)
+            if f.read(2) in (b"H+", b"HX"):
+                return 0
+    except Exception:
+        pass
+
+    try:
+        output = subprocess.check_output(["fdisk", "-l", img_path], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+
+    lines = output.strip().splitlines()
+    found = False
+    for line in lines:
+        if line.startswith("Device") or line.startswith("Périphérique"):
+            found = True
+            continue
+        if not found or not line.strip():
+            continue
+        cols = line.split()
+        bootable = '*' in cols
+        s = 2 if bootable else 1
+        try:
+            start_sector = int(cols[s])
+        except (IndexError, ValueError):
+            continue
+        offset = start_sector * 512
+        try:
+            with open(img_path, "rb") as f:
+                f.seek(offset + 1024)
+                if f.read(2) in (b"H+", b"HX"):
+                    return offset
+        except Exception:
+            continue
+    return None
+
+
+def list_apfs_volumes(img_path):
+    """
+    Run apfsutil against an APFS container image and parse its volume list.
+    Returns a list of dicts: {"id": int, "role": str, "name": str}
+    """
+    try:
+        output = subprocess.run(["apfsutil", img_path], capture_output=True, text=True, timeout=60).stdout
+    except Exception as e:
+        print(red(f"[-] Failed to run apfsutil: {e}"))
+        return []
+
+    volumes = []
+    current = None
+    for line in output.splitlines():
+        m = re.match(r'^Volume\s+(\d+)', line)
+        if m:
+            if current:
+                volumes.append(current)
+            current = {"id": int(m.group(1)), "role": "", "name": ""}
+            continue
+        if current is None:
+            continue
+        m = re.match(r'^Role:\s*(.*)$', line)
+        if m:
+            current["role"] = m.group(1).strip()
+            continue
+        m = re.match(r"^Name:\s*(.*?)(?:\s*\(Case-(?:in)?sensitive\))?$", line)
+        if m:
+            current["name"] = m.group(1).strip()
+            continue
+    if current:
+        volumes.append(current)
+    return volumes
+
+
+def select_apfs_volumes(volumes):
+    """
+    Choose the System (root) and Data (private) volumes among an APFS
+    volume list. Falls back to a single combined volume for pre-Catalina
+    layouts that never split System/Data.
+    Returns (system_volume, data_volume_or_None).
+    """
+    system_vol = next((v for v in volumes if "system" in v["role"].lower()), None)
+    data_vol = next((v for v in volumes if "data" in v["role"].lower()), None)
+
+    if system_vol is None:
+        excluded = {"preboot", "recovery", "vm", "update", "baseband", "xart",
+                    "hardware", "backup", "prelogin", "installer"}
+        candidates = [v for v in volumes
+                      if not any(k in v["role"].lower() for k in excluded)]
+        system_vol = candidates[0] if candidates else (volumes[0] if volumes else None)
+
+    return system_vol, data_vol
+
+
+def _replace_with_symlink(path, target):
+    """Replace path (dir/symlink/file, if it exists) with a symlink to target."""
+    if os.path.islink(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        os.rmdir(path)
+    elif os.path.exists(path):
+        os.remove(path)
+    os.symlink(target, path)
+
+
+def mount_dmg_image(image_path, mount_path):
+    """
+    Convert a .dmg with dmg2img, detect its filesystem (APFS or HFS+), and
+    mount it so that mount_path/root (+ mount_path/private-dir for the
+    modern macOS System/Data split) matches the layout expected by
+    determine_platform() and the get_mac_* functions.
+    Returns True on success.
+    """
+    if not check_dmg_prerequisites():
+        return False
+
+    os.makedirs(mount_path, exist_ok=True)
+    root_dir = os.path.join(mount_path, "root")
+    private_dir = os.path.join(mount_path, "private-dir")
+    os.makedirs(root_dir, exist_ok=True)
+
+    dmg_dir = os.path.dirname(os.path.abspath(image_path))
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    img_path = os.path.join(dmg_dir, f"{stem}.img")
+
+    print(yellow(f"[+] Converting {image_path} to raw image with dmg2img..."))
+    try:
+        result = subprocess.run(["dmg2img", "-s", "-i", image_path, "-o", img_path],
+                                 capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+            print(red(f"[-] dmg2img failed: {result.stderr.strip()}"))
+            return False
+        print(green(f"[+] Converted to {img_path}"))
+    except Exception as e:
+        print(red(f"[-] dmg2img failed: {e}"))
+        return False
+
+    fs_type = detect_dmg_fs_type(img_path)
+    print(yellow(f"[+] Detected filesystem: {fs_type or 'unknown'}"))
+
+    if fs_type == "apfs":
+        volumes = list_apfs_volumes(img_path)
+        if not volumes:
+            print(red("[-] apfsutil found no APFS volumes in the image."))
+            return False
+
+        print(yellow("[+] APFS volumes found:"))
+        for v in volumes:
+            print(f"    Volume {v['id']}: role='{v['role']}' name='{v['name']}'")
+
+        system_vol, data_vol = select_apfs_volumes(volumes)
+        if system_vol is None:
+            print(red("[-] Could not determine which APFS volume to mount as root."))
+            return False
+
+        print(green(f"[+] Mounting volume {system_vol['id']} ('{system_vol['name']}') at {root_dir}"))
+        try:
+            subprocess.run(["apfs-fuse", "-o", "ro", "-v", str(system_vol["id"]), img_path, root_dir],
+                            check=True)
+        except Exception as e:
+            print(red(f"[-] Failed to mount APFS system volume: {e}"))
+            return False
+
+        if data_vol is not None:
+            os.makedirs(private_dir, exist_ok=True)
+            print(green(f"[+] Mounting volume {data_vol['id']} ('{data_vol['name']}') at {private_dir}"))
+            try:
+                subprocess.run(["apfs-fuse", "-o", "ro", "-v", str(data_vol["id"]), img_path, private_dir],
+                                check=True)
+            except Exception as e:
+                print(red(f"[-] Failed to mount APFS data volume: {e}"))
+                return False
+        else:
+            print(yellow("[!] No dedicated Data volume found (pre-Catalina layout) — "
+                          "using the system volume for private-dir as well."))
+            _replace_with_symlink(private_dir, root_dir)
+
+    elif fs_type == "hfsplus":
+        offset = find_hfsplus_offset(img_path)
+        if offset is None:
+            print(red("[-] Could not locate an HFS+ volume in the converted image."))
+            return False
+        try:
+            subprocess.run(["mount", "-t", "hfsplus", "-o", f"ro,loop,offset={offset}", img_path, root_dir],
+                            check=True)
+            print(green(f"[+] Mounted HFS+ volume at {root_dir} (offset {offset})"))
+        except Exception as e:
+            print(red(f"[-] Failed to mount HFS+ volume: {e}"))
+            return False
+        # HFS+ dmg images predate the System/Data split — everything lives under root.
+        _replace_with_symlink(private_dir, root_dir)
+
+    else:
+        print(red("[-] Unrecognized filesystem in the converted image (neither APFS nor HFS+)."))
+        return False
+
+    return True
+
+
 parser = argparse.ArgumentParser(
     description="""Mount and Triage. Python Forensic Script
 
@@ -6183,13 +6714,13 @@ Exemple :
     formatter_class=argparse.RawTextHelpFormatter
 )
 
-parser.add_argument("-f", "--image", required=False, help="Path to disk image (.raw, .img, .qcow2, .E01)")
+parser.add_argument("-f", "--image", required=False, help="Path to disk image (.raw, .img, .qcow2, .E01, .dmg)")
 parser.add_argument("-d", "--mount", required=True, help="Mount directory")
 parser.add_argument("-t", "--threads", required=False, type=int, default=4, help="Number of threads")
 parser.add_argument("--automate", action="store_true",
                     help="Non-interactive mode: auto-select the OS partition and run full triage without prompts")
 parser.add_argument("--image-directory", dest="image_directory", required=False, metavar="DIR",
-                    help="Directory containing disk images. Triage all images found (.E01, .raw, .img, .qcow2, .001).\n"
+                    help="Directory containing disk images. Triage all images found (.E01, .raw, .img, .qcow2, .001, .dmg).\n"
                          "-d becomes the base directory; mount points are created as <-d>/<image_stem>/.\n"
                          "Implies --automate. Mutually exclusive with -f/--image.")
 args = parser.parse_args()
@@ -6209,7 +6740,7 @@ if args.image_directory:
         sys.exit(1)
 
     # Only pick the first file of a series (.E01, .001) — not .E02/.002 etc.
-    BATCH_EXTS = {'.e01', '.raw', '.img', '.qcow2', '.001'}
+    BATCH_EXTS = {'.e01', '.raw', '.img', '.qcow2', '.001', '.dmg'}
     images = sorted([
         f for f in img_dir.iterdir()
         if f.is_file() and f.suffix.lower() in BATCH_EXTS
@@ -6259,121 +6790,161 @@ if image_path:
 
     # Détection du format
     ext = image_path.lower().split('.')[-1]
-    is_img = ext == "img"
-    is_raw = ext == "raw"
-    is_001 = ext == "001"
-    is_e01 = ext == "e01"
-    is_qcow = ext == "qcow2"
-    real_image = image_path
+    is_dmg = ext == "dmg"
+
+    if is_dmg:
+        print("[+] Detected DMG image (macOS disk image)...")
+        image_format = "dmg"
+        real_image = image_path
+        if not mount_dmg_image(image_path, mount_path):
+            sys.exit(1)
+    else:
+        is_img = ext == "img"
+        is_raw = ext == "raw"
+        is_001 = ext == "001"
+        is_e01 = ext == "e01"
+        is_qcow = ext == "qcow2"
+        real_image = image_path
+
+        # Détection par magic bytes — corrige l'extension si besoin
+        magic_format = detect_format_by_magic(image_path)
+        ext_format = ("e01" if is_e01 else
+                      "qcow2" if is_qcow else
+                      "raw" if (is_001 or is_raw or is_img) else None)
+
+        if magic_format and ext_format and magic_format != ext_format:
+            print(yellow(f"[!] Extension suggests '{ext_format}' but magic bytes say '{magic_format}' — using magic bytes."))
+            is_e01  = magic_format == "e01"
+            is_qcow = magic_format == "qcow2"
+            is_img  = is_raw = is_001 = magic_format == "raw"
+        elif ext_format is None and magic_format:
+            print(yellow(f"[!] Unknown extension '{ext}', magic bytes identified as '{magic_format}'."))
+            is_e01  = magic_format == "e01"
+            is_qcow = magic_format == "qcow2"
+            is_img  = is_raw = is_001 = magic_format == "raw"
+
+        # --- E01 ---
+        if is_e01:
+            print("[+] Detected E01 image, mounting with ewfmount...")
+            image_format = "e01"
+            try:
+                for i in range(10):
+                    ewf_mountpoint = "/mnt/ewf" if i == 0 else f"/mnt_ewf_{i}"
+                    if not os.path.ismount(ewf_mountpoint):
+                        os.makedirs(ewf_mountpoint, exist_ok=True)
+                        break
+                else:
+                    print(red("[-] No free ewf mount point found"))
+                    sys.exit(1)
+
+                subprocess.run(["ewfmount", image_path, ewf_mountpoint], check=True)
+                real_image = os.path.join(ewf_mountpoint, "ewf1")
+            except Exception as e:
+                print(red(f"[-] Failed to mount E01 image: {e}"))
+                sys.exit(1)
+
+        # --- QCOW2 ---
+        elif is_qcow:
+            print("[+] Detected QCOW2 image, attaching with qemu-nbd...")
+            image_format = "qcow2"
+            try:
+                subprocess.run(["modprobe", "nbd"], check=True)
+                nbd_device = None
+                for i in range(16):
+                    candidate = f"/dev/nbd{i}"
+                    result = subprocess.run(["fdisk", "-l", candidate],
+                                            capture_output=True, text=True)
+                    if result.returncode != 0:
+                        nbd_device = candidate
+                        break
+                if not nbd_device:
+                    print(red("[-] No free /dev/nbdX device found"))
+                    sys.exit(1)
+
+                subprocess.run(["qemu-nbd", "--connect", nbd_device, image_path], check=True)
+                real_image = nbd_device
+                time.sleep(2)
+            except Exception as e:
+                print(red(f"[-] Failed to attach QCOW2 image: {e}"))
+                sys.exit(1)
+        elif is_001 or is_raw or is_img:
+            print("[+] Detected RAW image")
+            image_format = "raw"
 
 
-    # --- E01 ---
-    if is_e01:
-        print("[+] Detected E01 image, mounting with ewfmount...")
-        image_format = "e01"
+
+        # --- Partitions ---
         try:
-            for i in range(10):
-                ewf_mountpoint = "/mnt/ewf" if i == 0 else f"/mnt_ewf_{i}"
-                if not os.path.ismount(ewf_mountpoint):
-                    os.makedirs(ewf_mountpoint, exist_ok=True)
-                    break
+            output = subprocess.check_output(["fdisk", "-l", real_image], text=True)
+        except Exception as e:
+            print(red(f"[-] Failed to run fdisk: {e}"))
+            sys.exit(1)
+
+        lines = output.strip().splitlines()
+        partitions = []
+        found = False
+        for line in lines:
+            if line.startswith("Device") or line.startswith("Périphérique"):
+                found = True
+                continue
+            if found and line.strip():
+                partitions.append(line)
+
+        if not partitions:
+            print(yellow("[!] No partitions found — trying direct mount (no partition table)."))
+            image_stem = os.path.splitext(os.path.basename(image_path))[0]
+            fallback_mount = os.path.join(mount_path, image_stem)
+            if not os.path.exists(fallback_mount):
+                os.makedirs(fallback_mount)
+            try:
+                subprocess.run(["mount", "-o", "ro,norecovery", real_image, fallback_mount], check=True)
+                print(green(f"[+] Mounted directly at {fallback_mount}"))
+                mount_path = fallback_mount
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.run(["mount", "-o", "ro", real_image, fallback_mount], check=True)
+                    print(green(f"[+] Mounted directly at {fallback_mount} (ro only)"))
+                    mount_path = fallback_mount
+                except Exception as e:
+                    print(red(f"[-] Direct mount failed: {e}"))
+                    sys.exit(1)
+        else:
+            print(yellow("\n[+] Partitions found:"))
+            for i, part in enumerate(partitions, 1):
+                print(f"{i}: {part}")
+
+            if automate:
+                part_num = auto_select_partition(partitions, real_image)
+                if part_num is None:
+                    print(red("[-] --automate: could not determine OS partition. Aborting."))
+                    sys.exit(1)
             else:
-                print(red("[-] No free ewf mount point found"))
+                try:
+                    part_num = int(input("\n[?] Enter the number of the partition to mount: "))
+                    if not (1 <= part_num <= len(partitions)):
+                        raise ValueError
+                except:
+                    print(red("[-] Invalid input"))
+                    sys.exit(1)
+
+            chosen_line = partitions[part_num - 1].split()
+            if "*" in chosen_line:
+                offset_sector = int(chosen_line[2])
+            else:
+                offset_sector = int(chosen_line[1])
+            byte_offset = offset_sector * 512
+            sub_part = chosen_line[0]
+
+            # --- Montage ---
+            if not os.path.exists(mount_path):
+                os.makedirs(mount_path)
+
+            try:
+                subprocess.run(["mount", "-o", f"ro,norecovery,offset={byte_offset}", real_image, mount_path], check=True)
+                print(green(f"[+] Mounted partition {part_num} at {mount_path} (offset {byte_offset})"))
+            except Exception as e:
+                print(red(f"[-] Failed to mount: {e}"))
                 sys.exit(1)
-
-            subprocess.run(["ewfmount", image_path, ewf_mountpoint], check=True)
-            real_image = os.path.join(ewf_mountpoint, "ewf1")
-        except Exception as e:
-            print(red(f"[-] Failed to mount E01 image: {e}"))
-            sys.exit(1)
-
-    # --- QCOW2 ---
-    elif is_qcow:
-        print("[+] Detected QCOW2 image, attaching with qemu-nbd...")
-        image_format = "qcow2"
-        try:
-            subprocess.run(["modprobe", "nbd"], check=True)
-            nbd_device = None
-            for i in range(16):
-                candidate = f"/dev/nbd{i}"
-                result = subprocess.run(["fdisk", "-l", candidate],
-                                        capture_output=True, text=True)
-                if result.returncode != 0:
-                    nbd_device = candidate
-                    break
-            if not nbd_device:
-                print(red("[-] No free /dev/nbdX device found"))
-                sys.exit(1)
-
-            subprocess.run(["qemu-nbd", "--connect", nbd_device, image_path], check=True)
-            real_image = nbd_device
-            time.sleep(2)
-        except Exception as e:
-            print(red(f"[-] Failed to attach QCOW2 image: {e}"))
-            sys.exit(1)
-    elif is_001 or is_raw or is_img:
-        print("[+] Detected RAW image")
-        image_format = "raw"
-
-
-
-    # --- Partitions ---
-    try:
-        output = subprocess.check_output(["fdisk", "-l", real_image], text=True)
-    except Exception as e:
-        print(red(f"[-] Failed to run fdisk: {e}"))
-        sys.exit(1)
-
-    lines = output.strip().splitlines()
-    partitions = []
-    found = False
-    for line in lines:
-        if line.startswith("Device") or line.startswith("Périphérique"):
-            found = True
-            continue
-        if found and line.strip():
-            partitions.append(line)
-
-    if not partitions:
-        print(red("[-] No valid partitions found."))
-        sys.exit(1)
-
-    print(yellow("\n[+] Partitions found:"))
-    for i, part in enumerate(partitions, 1):
-        print(f"{i}: {part}")
-
-    if automate:
-        part_num = auto_select_partition(partitions, real_image)
-        if part_num is None:
-            print(red("[-] --automate: could not determine OS partition. Aborting."))
-            sys.exit(1)
-    else:
-        try:
-            part_num = int(input("\n[?] Enter the number of the partition to mount: "))
-            if not (1 <= part_num <= len(partitions)):
-                raise ValueError
-        except:
-            print(red("[-] Invalid input"))
-            sys.exit(1)
-
-    chosen_line = partitions[part_num - 1].split()
-    if "*" in chosen_line:
-        offset_sector = int(chosen_line[2])
-    else:
-        offset_sector = int(chosen_line[1])
-    byte_offset = offset_sector * 512
-    sub_part = chosen_line[0]
-
-    # --- Montage ---
-    if not os.path.exists(mount_path):
-        os.makedirs(mount_path)
-
-    try:
-        subprocess.run(["mount", "-o", f"ro,norecovery,offset={byte_offset}", real_image, mount_path], check=True)
-        print(green(f"[+] Mounted partition {part_num} at {mount_path} (offset {byte_offset})"))
-    except Exception as e:
-        print(red(f"[-] Failed to mount: {e}"))
-        sys.exit(1)
 
 
 if not os.path.exists(mount_path):
