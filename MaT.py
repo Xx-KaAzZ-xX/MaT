@@ -1517,7 +1517,7 @@ def get_browsing_history(mount_path, computer_name):
 
 
 def get_browsing_data(computer_name, mount_path):
-    output_file = os.path.join(script_path, result_folder, "browsing_data.csv")
+    output_file = os.path.join(script_path, result_folder, "linux_browsing_data.csv")
     csv_columns = ['computer_name', 'source', 'user', 'ident', 'creds', 'platform', 'saved_date', 'source_file', 'profile']
     print(yellow("[!] Retrieving browsing datas"))
 
@@ -1945,6 +1945,95 @@ def parse_crontab_line(line, is_user_crontab=False):
         user_crontab = (parts[5])
     return schedule, task, user_crontab
 
+
+def get_linux_admin_panel(mount_path, computer_name):
+    """
+    Detect known Linux hosting/admin control panels (VestaCP, HestiaCP, and
+    the most common self-hosted/commercial panels) by looking for their
+    configuration files, and record the associated log file when present.
+    """
+    print(yellow("[!] Looking for admin panel solutions ..."))
+    output_file = os.path.join(script_path, result_folder, "linux_admin_panel.csv")
+    csv_columns = ['computer_name', 'admin_panel_solution', 'admin_panel_configuration', 'admin_panel_log_filepath']
+
+    admin_panels = [
+        {
+            "name": "VestaCP",
+            "configs": ["usr/local/vesta/conf/vesta.conf"],
+            "logs": ["usr/local/vesta/log/system.log", "usr/local/vesta/log/auth.log"],
+        },
+        {
+            "name": "HestiaCP",
+            "configs": ["usr/local/hestia/conf/hestia.conf"],
+            "logs": ["usr/local/hestia/log/system.log", "usr/local/hestia/log/auth.log"],
+        },
+        {
+            "name": "cPanel/WHM",
+            "configs": ["var/cpanel/cpanel.config"],
+            "logs": ["usr/local/cpanel/logs/error_log", "usr/local/cpanel/logs/access_log"],
+        },
+        {
+            "name": "Plesk",
+            "configs": ["etc/psa/psa.conf"],
+            "logs": ["var/log/plesk/panel.log"],
+        },
+        {
+            "name": "Webmin",
+            "configs": ["etc/webmin/miniserv.conf"],
+            "logs": ["var/webmin/miniserv.log"],
+        },
+        {
+            "name": "ISPConfig",
+            "configs": ["usr/local/ispconfig/server/lib/config.inc.php", "usr/local/ispconfig/interface/lib/config.inc.php"],
+            "logs": ["usr/local/ispconfig/server/log/ispconfig.log", "var/log/ispconfig/cron.log"],
+        },
+        {
+            "name": "DirectAdmin",
+            "configs": ["usr/local/directadmin/conf/directadmin.conf"],
+            "logs": ["var/log/directadmin/error.log", "usr/local/directadmin/data/admin/logs/error.log"],
+        },
+    ]
+
+    detections = []
+    try:
+        for panel in admin_panels:
+            config_found = ""
+            for rel_config in panel["configs"]:
+                candidate = os.path.join(mount_path, rel_config)
+                if os.path.exists(candidate):
+                    config_found = candidate
+                    break
+
+            if not config_found:
+                continue
+
+            log_found = ""
+            for rel_log in panel["logs"]:
+                candidate = os.path.join(mount_path, rel_log)
+                if os.path.exists(candidate):
+                    log_found = candidate
+                    break
+
+            print(green(f"[+] {panel['name']} admin panel detected"))
+            detections.append({
+                "computer_name": computer_name,
+                "admin_panel_solution": panel["name"],
+                "admin_panel_configuration": config_found,
+                "admin_panel_log_filepath": log_found,
+            })
+
+        with open(output_file, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(detections)
+
+    except Exception as e:
+        print(red(f"[-] Error retrieving admin panel information: {e}"))
+
+    if detections:
+        print(green(f"[+] Admin panel information has been written into {output_file}"))
+    else:
+        print(yellow("[!] No known admin panel solution detected"))
 
 
 def get_linux_crontab(mount_path, computer_name):
@@ -6985,6 +7074,7 @@ if len(sys.argv) > 1:
             get_linux_browsing_history(mount_path, computer_name)
             get_linux_browsing_data(mount_path, computer_name)
             get_linux_crontab(mount_path, computer_name)
+            get_linux_admin_panel(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
