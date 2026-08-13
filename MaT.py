@@ -489,10 +489,18 @@ def _enrich_single_ip(ip, date_str):
         data     = requests.get(f"https://api.ipapi.is?q={ip}", timeout=10).json()
         asn_info = data.get("asn", {})
         loc      = data.get("location", {})
-        asn_num  = asn_info.get("asn")
-        asn_org  = asn_info.get("org") or data.get("company", {}).get("name", "")
+        # ipapi.is without an API key returns a flat schema (no nested
+        # "asn"/"location"/"company" objects, just top-level "cc",
+        # "asn_num", "asn_org", "company_name") — fall back to those when
+        # the nested lookup comes up empty, so this keeps working whether
+        # a richer (paid-key) or the flat (free) response comes back.
+        asn_num  = asn_info.get("asn") or asn_info.get("asn_num") or data.get("asn_num")
+        asn_org  = (asn_info.get("org") or data.get("company", {}).get("name")
+                    or data.get("company_name") or data.get("asn_org") or "")
         result["asn"]     = f"AS{asn_num} {asn_org}".strip() if asn_num else ""
         result["country"] = loc.get("country_code", "")
+        if not result["country"]:
+            result["country"] = data.get("cc", "")
 
         is_dc    = data.get("is_datacenter", False)
         is_tor   = data.get("is_tor",   False)
@@ -523,7 +531,7 @@ def _enrich_single_ip(ip, date_str):
 
 
 def _enrich_connections_background(output_file):
-    """Background thread: enrich linux_connections.csv with asn/country/ip_type/tor_exit."""
+    """Background thread: enrich linux_connections.csv or windows_connections.csv with asn/country/ip_type/tor_exit."""
     try:
         df = pd.read_csv(output_file)
         for col in ["asn", "country", "ip_type", "tor_exit"]:
@@ -1155,6 +1163,17 @@ def _parse_zsh_history(hist_file):
         yield pending_timestamp, pending_command
 
 
+def _escape_command_field(command):
+    """
+    Escape embedded newlines/carriage returns so a multi-line command (zsh
+    continuation lines, heredocs, pasted multi-line snippets, ...) always
+    stays on a single physical CSV line. The CSV itself stays RFC4180-valid
+    either way (the field is quoted), but line-oriented log indexers that
+    don't respect CSV quoting cut a raw newline into a broken record.
+    """
+    return command.replace('\r\n', '\\n').replace('\n', '\\n').replace('\r', '\\n')
+
+
 def get_command_history(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "linux_command_history.csv")
     print(yellow("[!] Retrieving command history ..."))
@@ -1185,6 +1204,7 @@ def get_command_history(mount_path, computer_name):
                                         command = command.strip()
                                         if not command:
                                             continue
+                                        command = _escape_command_field(command)
                                         timestamp = ""
                                         if raw_timestamp:
                                             try:
@@ -1202,6 +1222,7 @@ def get_command_history(mount_path, computer_name):
                                     for command in hist_file:
                                         command = command.strip()
                                         if command:
+                                            command = _escape_command_field(command)
                                             writer.writerow({
                                                 'computer_name': computer_name,
                                                 'user': user,
@@ -2284,16 +2305,20 @@ def _collect_docker_containers(mount_path, computer_name):
         for candidate in (
             os.path.join(mount_path, "var", "lib", "docker"),
             os.path.join(mount_path, "data", "docker"),
+            # Docker Desktop's "docker-desktop-data" WSL2 disk (docker_data.vhdx):
+            # this distro exists solely to be bind-mounted as /var/lib/docker into
+            # the "docker-desktop" engine distro, so ITS OWN filesystem root already
+            # IS /var/lib/docker's content (containers/, image/, overlay2/... sit
+            # directly at the mount root, with no var/lib/docker or data/docker prefix).
+            mount_path,
         ):
-            if os.path.isdir(candidate):
+            if os.path.isdir(os.path.join(candidate, "containers")):
                 docker_root = candidate
                 break
         if docker_root is None:
             return rows
 
         docker_containers_dir = os.path.join(docker_root, "containers")
-        if not os.path.isdir(docker_containers_dir):
-            return rows
 
         metadata_v2 = _parse_metadata_v2(mount_path)
 
@@ -2422,20 +2447,43 @@ _FS_SKIP = {
 }
 
 
+def _get_claude_account_email(home_dir):
+    """
+    Read ~/.claude.json — Claude Code's local account/state file, a sibling
+    of the .claude/ directory (NOT inside it) — for the oauthAccount.emailAddress
+    field, which identifies the account behind a `claude login` (OAuth /
+    claude.ai subscription) session. Returns "" if the file/field is absent,
+    which is expected when the machine instead uses API-key auth
+    (ANTHROPIC_API_KEY / apiKeyHelper) — that path has no local account/email
+    trace at all, only an org-scoped key.
+    """
+    claude_json_path = os.path.join(home_dir, ".claude.json")
+    if not os.path.isfile(claude_json_path):
+        return ""
+    try:
+        with open(claude_json_path, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+        return data.get("oauthAccount", {}).get("emailAddress", "") or ""
+    except Exception:
+        return ""
+
+
 def get_ia_apps(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "ia_apps.csv")
-    csv_columns  = ['computer_name', 'ia_app', 'file_path']
+    csv_columns  = ['computer_name', 'ia_app', 'ia_account', 'file_path']
     print(yellow("[!] Searching for AI assistant application artifacts (full FS scan)..."))
 
     try:
-        counter  = 0
-        reported = set()   # évite les doublons (même chemin via chemins symlinks)
+        counter     = 0
+        reported    = set()   # évite les doublons (même chemin via chemins symlinks)
+        claude_dirs = []      # .claude dirs found -> fed to get_claude_code_prompts() below
+        aider_dirs  = set()   # dirs containing .aider.* files -> fed to get_aider_prompts() below
 
         with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
             writer.writeheader()
 
-            def _write(app, path):
+            def _write(app, path, account=""):
                 nonlocal counter
                 if path in reported:
                     return
@@ -2443,6 +2491,7 @@ def get_ia_apps(mount_path, computer_name):
                 writer.writerow({
                     "computer_name": computer_name,
                     "ia_app":        app,
+                    "ia_account":    account,
                     "file_path":     path,
                 })
                 counter += 1
@@ -2460,7 +2509,12 @@ def get_ia_apps(mount_path, computer_name):
 
                     # 1. Nom de dossier identifiant directement une app
                     if d in _IA_DIR_NAMES:
-                        _write(_IA_DIR_NAMES[d], full_d)
+                        account = ""
+                        if _IA_DIR_NAMES[d] == "Claude Code":
+                            account = _get_claude_account_email(root)
+                        _write(_IA_DIR_NAMES[d], full_d, account)
+                        if _IA_DIR_NAMES[d] == "Claude Code":
+                            claude_dirs.append(full_d)
                         dirs.remove(d)   # inutile de descendre plus loin
                         continue
 
@@ -2479,14 +2533,387 @@ def get_ia_apps(mount_path, computer_name):
                 for f in files:
                     if f in _IA_FILE_NAMES:
                         _write(_IA_FILE_NAMES[f], os.path.join(root, f))
+                        if _IA_FILE_NAMES[f] == "Aider":
+                            aider_dirs.add(root)
 
         if counter >= 1:
             print(green(f"[+] IA apps artifacts written into {output_file} ({counter} entries)"))
         else:
             print(yellow(f"No IA apps artifacts found, {output_file} should be empty"))
 
+        # Prompt-capable IA tools detected -> collect their prompt/response
+        # rows and write them all into one shared ia_prompts.csv (ia_app +
+        # source_file distinguish which tool/file each row came from).
+        prompt_rows = []
+        if claude_dirs:
+            prompt_rows.extend(get_claude_code_prompts(claude_dirs, computer_name))
+        if aider_dirs:
+            prompt_rows.extend(get_aider_prompts(sorted(aider_dirs), computer_name))
+
+        if prompt_rows:
+            prompts_output_file = os.path.join(script_path, result_folder, "ia_prompts.csv")
+            prompt_columns = ['computer_name', 'ia_app', 'prompt', 'response', 'timestamp', 'source_file']
+            with open(prompts_output_file, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=prompt_columns)
+                writer.writeheader()
+                writer.writerows(prompt_rows)
+            print(green(f"[+] IA prompts have been written into {prompts_output_file} ({len(prompt_rows)} entries)"))
+
     except Exception as e:
         print(red(f"[-] Error writing IA apps info: {e}"))
+
+
+def _parse_claude_transcript(path):
+    """
+    Parse one Claude Code session transcript
+    (~/.claude/projects/<project-slug>/<session-uuid>.jsonl) into
+    (prompt, response, timestamp) tuples.
+
+    Each line is one event with a "type" ("user"/"assistant"/...) and a
+    "message" (role + content). A "user" event only counts as a genuine
+    prompt when its content is plain text — "user"-typed events whose
+    content is a list of tool_result blocks are the model's own tool
+    output being fed back, not something the human typed, so they're
+    skipped. The paired response is the concatenation of every assistant
+    text block that follows, across any number of tool-use/tool-result
+    round trips, up to the next genuine user prompt (a single prompt can
+    trigger several assistant turns before its final text answer).
+    """
+    pairs = []
+    pending_prompt = None
+    pending_timestamp = None
+    pending_response_parts = []
+
+    def _flush():
+        if pending_prompt is not None:
+            pairs.append((pending_prompt, "\n".join(pending_response_parts).strip(), pending_timestamp or ""))
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+
+                etype   = event.get("type")
+                message = event.get("message", {}) or {}
+                content = message.get("content")
+
+                if etype == "user":
+                    text = None
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list) and content and all(
+                        isinstance(b, dict) and b.get("type") == "text" for b in content
+                    ):
+                        text = "\n".join(b.get("text", "") for b in content)
+
+                    if text is not None and text.strip():
+                        _flush()
+                        pending_prompt = text.strip()
+                        pending_timestamp = event.get("timestamp", "")
+                        pending_response_parts = []
+                    # else: tool_result feedback disguised as a "user" event — not a real prompt, ignore
+
+                elif etype == "assistant" and pending_prompt is not None:
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text", "").strip()
+                                if t:
+                                    pending_response_parts.append(t)
+                    elif isinstance(content, str) and content.strip():
+                        pending_response_parts.append(content.strip())
+
+        _flush()
+    except Exception as e:
+        print(red(f"[-] Error reading transcript {path}: {e}"))
+    return pairs
+
+
+def _parse_claude_history_jsonl(path):
+    """
+    ~/.claude/history.jsonl backs Claude Code's shell-style prompt recall
+    (up-arrow) — each line is {"display": <prompt text>, "timestamp":
+    <epoch ms>, "project": <cwd>}. No response is stored here; only used
+    as a fallback to catch prompts with no matching session transcript
+    (e.g. a crashed session, or a projects/ subfolder that got deleted).
+    Returns a list of (prompt, timestamp) tuples.
+    """
+    prompts = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+
+                display = (entry.get("display") or "").strip()
+                if not display:
+                    continue
+
+                timestamp = ""
+                ts_ms = entry.get("timestamp")
+                if ts_ms:
+                    try:
+                        timestamp = datetime.fromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        timestamp = ""
+
+                prompts.append((display, timestamp))
+    except Exception as e:
+        print(red(f"[-] Error reading {path}: {e}"))
+    return prompts
+
+
+def get_claude_code_prompts(claude_dirs, computer_name):
+    """
+    Sub-function of get_ia_apps(): only called when it has actually found
+    one or more .claude directories. For each, extract prompt/response
+    pairs:
+      - primary source: ~/.claude/projects/**/*.jsonl session transcripts,
+        which hold real prompts paired with the assistant's answer;
+      - secondary/fallback source: ~/.claude/history.jsonl (prompt +
+        timestamp only, no response) — only added for prompts not already
+        recovered from a transcript, to catch orphaned entries.
+
+    Prompt/response text is escaped with _escape_command_field() (embedded
+    newlines -> literal \\n) so a multi-line prompt or a code block in a
+    response can never break a line-oriented CSV consumer — same issue as
+    the zsh multi-line command history fix.
+
+    claude_dirs: list of .claude directory paths already located by get_ia_apps().
+    Returns a list of row dicts (computer_name, ia_app, prompt, response,
+    timestamp, source_file) — get_ia_apps() is responsible for writing them
+    to the shared ia_prompts.csv alongside other IA tools' rows.
+    """
+    print(yellow("[!] Claude Code detected — parsing prompt history ..."))
+
+    rows = []
+    seen_prompts = set()
+
+    for claude_dir in claude_dirs:
+        # 1. Session transcripts (real prompt/response pairs)
+        projects_dir = os.path.join(claude_dir, "projects")
+        if os.path.isdir(projects_dir):
+            for project_name in os.listdir(projects_dir):
+                project_path = os.path.join(projects_dir, project_name)
+                if not os.path.isdir(project_path):
+                    continue
+                for fname in os.listdir(project_path):
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    transcript_path = os.path.join(project_path, fname)
+                    for prompt, response, timestamp in _parse_claude_transcript(transcript_path):
+                        seen_prompts.add(prompt)
+                        rows.append({
+                            "computer_name": computer_name,
+                            "ia_app": "Claude Code",
+                            "prompt": _escape_command_field(prompt),
+                            "response": _escape_command_field(response),
+                            "timestamp": timestamp,
+                            "source_file": transcript_path,
+                        })
+
+        # 2. history.jsonl (fallback for prompts with no matching transcript)
+        history_path = os.path.join(claude_dir, "history.jsonl")
+        if os.path.isfile(history_path):
+            for prompt, timestamp in _parse_claude_history_jsonl(history_path):
+                if prompt in seen_prompts:
+                    continue
+                seen_prompts.add(prompt)
+                rows.append({
+                    "computer_name": computer_name,
+                    "ia_app": "Claude Code",
+                    "prompt": _escape_command_field(prompt),
+                    "response": "",
+                    "timestamp": timestamp,
+                    "source_file": history_path,
+                })
+
+    return rows
+
+
+def _parse_aider_input_history(path):
+    """
+    .aider.input.history is a prompt_toolkit FileHistory file: each entry is
+    "# <timestamp>" followed by the (possibly multi-line) prompt, one line
+    per source line prefixed with "+", e.g.:
+
+        # 2025-06-14 02:56:47.239474
+        +first line of the prompt
+        +second line of the prompt
+
+    Returns a list of (prompt, timestamp) tuples.
+    """
+    entries = []
+    pending_lines = []
+    pending_ts = None
+
+    def _flush():
+        if pending_ts is not None:
+            prompt = "\n".join(pending_lines).strip()
+            if prompt:
+                entries.append((prompt, pending_ts))
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
+                m = re.match(r'^#\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*$', line)
+                if m:
+                    _flush()
+                    pending_ts = m.group(1)
+                    pending_lines = []
+                    continue
+                if line.startswith("+"):
+                    pending_lines.append(line[1:])
+        _flush()
+    except Exception as e:
+        print(red(f"[-] Error reading {path}: {e}"))
+    return entries
+
+
+def _parse_aider_chat_history(path):
+    """
+    .aider.chat.history.md is Aider's markdown conversation transcript:
+      - "# aider chat started at <timestamp>" marks a new session (one
+        timestamp per session, not per message);
+      - each "#### " -prefixed line is (one line of) a user prompt;
+      - each "> " -prefixed line is Aider's own tool/meta noise (banners,
+        git commit messages, "Tokens: ... Cost: ..." lines) — not
+        conversation content, discarded;
+      - everything else is the assistant's raw markdown reply.
+
+    Returns a list of (prompt, response, session_timestamp) tuples.
+    """
+    pairs = []
+    session_ts = ""
+    prompt_lines = []
+    response_lines = []
+    have_prompt = False
+    in_prompt_block = False   # True while still consuming consecutive "####" lines of the CURRENT prompt
+
+    def _flush():
+        if have_prompt:
+            prompt = "\n".join(prompt_lines).strip()
+            response = "\n".join(response_lines).strip()
+            if prompt:
+                pairs.append((prompt, response, session_ts))
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n").rstrip()  # also drops the markdown trailing-double-space line break
+
+                m_session = re.match(r'^#\s+aider chat started at\s+(.+)$', line)
+                if m_session:
+                    _flush()
+                    session_ts = m_session.group(1).strip()
+                    prompt_lines, response_lines, have_prompt, in_prompt_block = [], [], False, False
+                    continue
+
+                if line.startswith("####"):
+                    content = line[4:]
+                    if content.startswith(" "):
+                        content = content[1:]
+                    if have_prompt and not in_prompt_block:
+                        # already past this turn's prompt block (into its response) -> new prompt
+                        _flush()
+                        prompt_lines, response_lines = [], []
+                    prompt_lines.append(content)
+                    have_prompt = True
+                    in_prompt_block = True
+                    continue
+
+                if line.startswith(">"):
+                    in_prompt_block = False
+                    continue
+
+                if have_prompt:
+                    response_lines.append(line)
+                    in_prompt_block = False
+
+        _flush()
+    except Exception as e:
+        print(red(f"[-] Error reading {path}: {e}"))
+    return pairs
+
+
+def get_aider_prompts(aider_dirs, computer_name):
+    """
+    Sub-function of get_ia_apps(): only called when it has found one or more
+    directories containing Aider's .aider.chat.history.md / .aider.input.history.
+    For each directory, extract prompt/response pairs:
+      - primary source: .aider.chat.history.md, which holds the full
+        conversation (prompt + the assistant's reply) but only one
+        timestamp per session, not per message;
+      - .aider.input.history gives a precise per-prompt timestamp (down to
+        the microsecond, no response) — used to sharpen the timestamp of a
+        matching chat-history prompt (exact text match), and as a fallback
+        source (response left empty) for prompts with no match at all in
+        chat.history.md.
+
+    Prompt/response text is escaped with _escape_command_field() for the
+    same reason as the zsh/Claude Code history: a multi-line prompt or a
+    diff in a response must never break a line-oriented CSV consumer.
+
+    aider_dirs: list of directories already located by get_ia_apps().
+    Returns a list of row dicts (computer_name, ia_app, prompt, response,
+    timestamp, source_file) — get_ia_apps() is responsible for writing them
+    to the shared ia_prompts.csv alongside other IA tools' rows.
+    """
+    print(yellow("[!] Aider detected — parsing prompt history ..."))
+
+    rows = []
+
+    for aider_dir in aider_dirs:
+        chat_path  = os.path.join(aider_dir, ".aider.chat.history.md")
+        input_path = os.path.join(aider_dir, ".aider.input.history")
+
+        input_entries = _parse_aider_input_history(input_path) if os.path.isfile(input_path) else []
+        ts_by_prompt = {}
+        for prompt, ts in input_entries:
+            ts_by_prompt.setdefault(prompt, ts)   # first occurrence wins if typed more than once
+
+        seen_prompts = set()
+
+        if os.path.isfile(chat_path):
+            for prompt, response, session_ts in _parse_aider_chat_history(chat_path):
+                seen_prompts.add(prompt)
+                timestamp = ts_by_prompt.get(prompt, session_ts)
+                rows.append({
+                    "computer_name": computer_name,
+                    "ia_app": "Aider",
+                    "prompt": _escape_command_field(prompt),
+                    "response": _escape_command_field(response),
+                    "timestamp": timestamp,
+                    "source_file": chat_path,
+                })
+
+        # fallback: prompts typed but with no match in chat history (e.g. a truncated/corrupted .md)
+        for prompt, ts in input_entries:
+            if prompt in seen_prompts:
+                continue
+            seen_prompts.add(prompt)
+            rows.append({
+                "computer_name": computer_name,
+                "ia_app": "Aider",
+                "prompt": _escape_command_field(prompt),
+                "response": "",
+                "timestamp": ts,
+                "source_file": input_path,
+            })
+
+    return rows
 
 
 def _mount_vhdx(vhdx_path):
@@ -2585,244 +3012,264 @@ def _umount_vhdx(mount_point, nbd_dev, tmp_vhdx=None):
 
 
 
-def get_windows_docker_wsl(mount_path, computer_name):
-    output_file = os.path.join(script_path, result_folder, "windows_docker_wsl.csv")
+def get_windows_docker(mount_path, computer_name):
+    """
+    Detect Docker containers on a Windows image regardless of which
+    application is running them: native Windows Docker Engine
+    (ProgramData\\Docker\\containers), Docker Desktop's WSL2 data disk
+    (AppData\\Local\\Docker\\...\\docker_data.vhdx / ext4.vhdx), or a plain
+    WSL distro that happens to have Docker installed inside it
+    (AppData\\Local\\Packages\\<distro>\\LocalState\\*.vhdx).
+
+    Container rows use the exact same schema as get_linux_docker(), plus a
+    'container_app' column identifying which of the above hosted it — so
+    downstream analysis doesn't need to care which application was used.
+
+    Artifact-only findings (a .vhdx that couldn't be mounted, Docker Desktop
+    / Docker CLI config files) have no container to attach to and are
+    written separately to windows_docker_artifacts.csv.
+    """
+    output_file = os.path.join(script_path, result_folder, "windows_docker.csv")
+    artifacts_output_file = os.path.join(script_path, result_folder, "windows_docker_artifacts.csv")
     csv_columns = [
-        'computer_name', 'type', 'container_name', 'container_state',
-        'container_ip', 'exposed_ports', 'volumes', 'container_logs',
-        'overlay_directory', 'image_url', 'build_time', 'artifact_path',
+        'computer_name', 'container_name', 'container_state', 'container_ip',
+        'exposed_ports', 'volumes', 'container_logs', 'overlay_directory',
+        'image_url', 'build_time', 'container_app',
     ]
-    print(yellow("[!] Retrieving Docker Desktop / WSL docker information..."))
+    artifact_columns = ['computer_name', 'type', 'artifact_path']
+    print(yellow("[!] Retrieving Docker container information (native / Docker Desktop / WSL)..."))
+
+    container_rows = []
+    artifact_rows = []
+
+    def _add_container(row, container_app):
+        row['container_app'] = container_app
+        container_rows.append(row)
+
+    def _add_artifact(type_, artifact_path):
+        artifact_rows.append({
+            "computer_name": computer_name,
+            "type": type_,
+            "artifact_path": artifact_path,
+        })
 
     try:
-        counter = 0
-        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
-            writer.writeheader()
+        # ── 1. Native Windows Docker containers (ProgramData\Docker\containers\) ──
+        win_containers_dir = os.path.join(mount_path, "ProgramData", "Docker", "containers")
+        win_buildkit_db    = os.path.join(mount_path, "ProgramData", "Docker", "buildkit", "metadata_v2.db")
 
-            def _write_row(type_, artifact_path, container_name="", container_state="",
-                           container_ip="", exposed_ports="", volumes="",
-                           container_logs="", overlay_directory="",
-                           image_url="", build_time=""):
-                nonlocal counter
-                writer.writerow({
-                    "computer_name":     computer_name,
-                    "type":              type_,
-                    "container_name":    container_name,
-                    "container_state":   container_state,
-                    "container_ip":      container_ip,
-                    "exposed_ports":     exposed_ports,
-                    "volumes":           volumes,
-                    "container_logs":    container_logs,
-                    "overlay_directory": overlay_directory,
-                    "image_url":         image_url,
-                    "build_time":        build_time,
-                    "artifact_path":     artifact_path,
-                })
-                counter += 1
-
-            # ── 1. Windows native Docker containers (ProgramData\Docker\containers\) ──
-            win_containers_dir = os.path.join(mount_path, "ProgramData", "Docker", "containers")
-            win_buildkit_db    = os.path.join(mount_path, "ProgramData", "Docker", "buildkit", "metadata_v2.db")
-
-            win_metadata = {}
-            try:
-                if os.path.exists(win_buildkit_db):
-                    print(f" Docker native mode found.")
-                    with open(win_buildkit_db, "rb") as f:
-                        raw = f.read()
-                    content  = raw.decode("latin-1")
-                    desc_re  = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
-                    diff_re  = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
-                    ts_re    = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
-                    WINDOW   = 3000
-                    for m in desc_re.finditer(content):
-                        try:
-                            url     = m.group(1)
-                            pos     = m.start()
-                            segment = content[max(0, pos - WINDOW) : pos + WINDOW]
-                            diff_m  = diff_re.search(segment)
-                            if not diff_m:
-                                continue
-                            diff_id   = diff_m.group(1)
-                            pull_time = ""
-                            ts_m = ts_re.search(segment)
-                            if ts_m:
-                                try:
-                                    ns = int(ts_m.group(1))
-                                    pull_time = (
-                                        datetime(1970, 1, 1) + timedelta(seconds=ns / 1e9)
-                                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                                except Exception:
-                                    pass
-                            win_metadata[diff_id] = {"url": url, "pull_time": pull_time}
-                        except Exception:
+        win_metadata = {}
+        try:
+            if os.path.exists(win_buildkit_db):
+                print(f" Docker native mode found.")
+                with open(win_buildkit_db, "rb") as f:
+                    raw = f.read()
+                content  = raw.decode("latin-1")
+                desc_re  = re.compile(r'cache\.description\{"value":"pulled from ([^"]+)"\}')
+                diff_re  = re.compile(r'cache\.diffID\{"value":"(sha256:[a-f0-9]{64})"\}')
+                ts_re    = re.compile(r'cache\.createdAt\{"value":(\d+)\}')
+                WINDOW   = 3000
+                for m in desc_re.finditer(content):
+                    try:
+                        url     = m.group(1)
+                        pos     = m.start()
+                        segment = content[max(0, pos - WINDOW) : pos + WINDOW]
+                        diff_m  = diff_re.search(segment)
+                        if not diff_m:
                             continue
+                        diff_id   = diff_m.group(1)
+                        pull_time = ""
+                        ts_m = ts_re.search(segment)
+                        if ts_m:
+                            try:
+                                ns = int(ts_m.group(1))
+                                pull_time = (
+                                    datetime(1970, 1, 1) + timedelta(seconds=ns / 1e9)
+                                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except Exception:
+                                pass
+                        win_metadata[diff_id] = {"url": url, "pull_time": pull_time}
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if os.path.isdir(win_containers_dir):
+            try:
+                for container_id in os.listdir(win_containers_dir):
+                    container_path = os.path.join(win_containers_dir, container_id)
+                    config_path    = os.path.join(container_path, "config.v2.json")
+                    if not os.path.isfile(config_path):
+                        continue
+                    try:
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        container_name  = data.get("Name", "").lstrip("/")
+                        container_state = data.get("State", {}).get("Running", "")
+                        container_ip    = ""
+                        networks = data.get("NetworkSettings", {}).get("Networks", {})
+                        for net_data in networks.values():
+                            ip = net_data.get("IPAddress")
+                            if ip:
+                                container_ip = ip
+                                break
+                        container_ports = ",".join(
+                            data.get("Config", {}).get("ExposedPorts", {}).keys()
+                        ) if data.get("Config", {}).get("ExposedPorts") else ""
+                        container_logs = data.get("LogPath", "") or ""
+                        if container_logs:
+                            container_logs = os.path.join(
+                                mount_path, container_logs.lstrip("/\\")
+                            )
+                        mounts  = data.get("MountPoints", {})
+                        volumes = ",".join(
+                            [m.get("Source", "") for m in mounts.values() if "Source" in m]
+                        )
+                        graphdriver       = data.get("GraphDriver", {})
+                        graph_data        = graphdriver.get("Data", {})
+                        overlay_directory = graph_data.get("Dir") or graph_data.get("MergedDir") or "Unknown"
+                        image_url  = ""
+                        build_time = ""
+                        image_field = data.get("Image", "")
+                        if image_field and ":" in image_field:
+                            try:
+                                algo, digest = image_field.split(":", 1)
+                                for driver in ("windowsfilter", "overlay2"):
+                                    imagedb_path = os.path.join(
+                                        mount_path, "ProgramData", "Docker", "image",
+                                        driver, "imagedb", "content", algo, digest
+                                    )
+                                    if os.path.exists(imagedb_path):
+                                        with open(imagedb_path, "r", encoding="utf-8") as f:
+                                            img_data = json.load(f)
+                                        build_time = img_data.get("created", "")
+                                        for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
+                                            if diff_id in win_metadata:
+                                                image_url = win_metadata[diff_id]["url"]
+                                                break
+                                        break
+                            except Exception:
+                                pass
+                        _add_container({
+                            "computer_name":     computer_name,
+                            "container_name":    container_name,
+                            "container_state":   container_state,
+                            "container_ip":      container_ip,
+                            "exposed_ports":     container_ports,
+                            "volumes":           volumes,
+                            "container_logs":    container_logs,
+                            "overlay_directory": overlay_directory,
+                            "image_url":         image_url,
+                            "build_time":        build_time,
+                        }, container_app="docker_native")
+                    except Exception as e:
+                        print(red(f"[-] Error processing Windows container {container_id}: {e}"))
             except Exception:
                 pass
 
-            if os.path.isdir(win_containers_dir):
-                try:
-                    for container_id in os.listdir(win_containers_dir):
-                        container_path = os.path.join(win_containers_dir, container_id)
-                        config_path    = os.path.join(container_path, "config.v2.json")
-                        if not os.path.isfile(config_path):
-                            continue
+        # ── 2. Docker Desktop WSL2 + WSL distros (per user) ─────────────────────
+        users_dir = os.path.join(mount_path, "Users")
+        if os.path.isdir(users_dir):
+            print(f" Docker WSL mode found.")
+            try:
+                for username in os.listdir(users_dir):
+                    user_path = os.path.join(users_dir, username)
+                    if not os.path.isdir(user_path):
+                        continue
+
+                    # AppData\Local\Docker\ — Docker Desktop WSL2 disks (ext4.vhdx / docker_data.vhdx)
+                    docker_local = os.path.join(user_path, "AppData", "Local", "Docker")
+                    if os.path.isdir(docker_local):
                         try:
-                            with open(config_path, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                            container_name  = data.get("Name", "").lstrip("/")
-                            container_state = data.get("State", {}).get("Running", "")
-                            container_ip    = ""
-                            networks = data.get("NetworkSettings", {}).get("Networks", {})
-                            for net_data in networks.values():
-                                ip = net_data.get("IPAddress")
-                                if ip:
-                                    container_ip = ip
-                                    break
-                            container_ports = ",".join(
-                                data.get("Config", {}).get("ExposedPorts", {}).keys()
-                            ) if data.get("Config", {}).get("ExposedPorts") else ""
-                            container_logs = data.get("LogPath", "") or ""
-                            if container_logs:
-                                container_logs = os.path.join(
-                                    mount_path, container_logs.lstrip("/\\")
-                                )
-                            mounts  = data.get("MountPoints", {})
-                            volumes = ",".join(
-                                [m.get("Source", "") for m in mounts.values() if "Source" in m]
-                            )
-                            graphdriver       = data.get("GraphDriver", {})
-                            graph_data        = graphdriver.get("Data", {})
-                            overlay_directory = graph_data.get("Dir") or graph_data.get("MergedDir") or "Unknown"
-                            image_url  = ""
-                            build_time = ""
-                            image_field = data.get("Image", "")
-                            if image_field and ":" in image_field:
+                            for subroot, _, subfiles in os.walk(docker_local, onerror=lambda e: None):
+                                for fname in subfiles:
+                                    if fname.lower().endswith(".vhdx"):
+                                        vhdx = os.path.join(subroot, fname)
+                                        vhdx_mount, nbd_dev, tmp_vhdx = _mount_vhdx(vhdx)
+                                        found_container = False
+                                        if vhdx_mount:
+                                            try:
+                                                for row in _collect_docker_containers(vhdx_mount, computer_name):
+                                                    _add_container(row, container_app="docker_desktop_wsl2")
+                                                    found_container = True
+                                            finally:
+                                                _umount_vhdx(vhdx_mount, nbd_dev, tmp_vhdx)
+                                        if not found_container:
+                                            # engine disk (ext4.vhdx) or unmountable/empty data disk:
+                                            # keep the artifact as evidence Docker Desktop was installed
+                                            _add_artifact("docker_desktop_wsl_disk", vhdx)
+                        except Exception:
+                            pass
+
+                    # AppData\Roaming\Docker\ — Docker Desktop settings / daemon config
+                    docker_roaming = os.path.join(user_path, "AppData", "Roaming", "Docker")
+                    if os.path.isdir(docker_roaming):
+                        try:
+                            for cfg_file in ("settings.json", "settings-store.json", "daemon.json"):
+                                cfg_path = os.path.join(docker_roaming, cfg_file)
+                                if os.path.isfile(cfg_path):
+                                    _add_artifact("docker_desktop_config", cfg_path)
+                        except Exception:
+                            pass
+
+                    # .docker\config.json — Docker CLI credentials / config
+                    docker_cli = os.path.join(user_path, ".docker", "config.json")
+                    if os.path.isfile(docker_cli):
+                        try:
+                            _add_artifact("docker_cli_config", docker_cli)
+                        except Exception:
+                            pass
+
+                    # AppData\Local\Packages\<distro>\LocalState\*.vhdx — plain WSL distro disks
+                    packages_dir = os.path.join(user_path, "AppData", "Local", "Packages")
+                    if os.path.isdir(packages_dir):
+                        try:
+                            for pkg_name in os.listdir(packages_dir):
+                                local_state = os.path.join(packages_dir, pkg_name, "LocalState")
+                                if not os.path.isdir(local_state):
+                                    continue
                                 try:
-                                    algo, digest = image_field.split(":", 1)
-                                    for driver in ("windowsfilter", "overlay2"):
-                                        imagedb_path = os.path.join(
-                                            mount_path, "ProgramData", "Docker", "image",
-                                            driver, "imagedb", "content", algo, digest
-                                        )
-                                        if os.path.exists(imagedb_path):
-                                            with open(imagedb_path, "r", encoding="utf-8") as f:
-                                                img_data = json.load(f)
-                                            build_time = img_data.get("created", "")
-                                            for diff_id in img_data.get("rootfs", {}).get("diff_ids", []):
-                                                if diff_id in win_metadata:
-                                                    image_url = win_metadata[diff_id]["url"]
-                                                    break
-                                            break
-                                except Exception:
-                                    pass
-                            _write_row(
-                                type_="windows_container",
-                                artifact_path=config_path,
-                                container_name=container_name,
-                                container_state=container_state,
-                                container_ip=container_ip,
-                                exposed_ports=container_ports,
-                                volumes=volumes,
-                                container_logs=container_logs,
-                                overlay_directory=overlay_directory,
-                                image_url=image_url,
-                                build_time=build_time,
-                            )
-                        except Exception as e:
-                            print(red(f"[-] Error processing Windows container {container_id}: {e}"))
-                except Exception:
-                    pass
-
-            # ── 2. Docker Desktop WSL2 + WSL distros (per user) ─────────────────────
-            users_dir = os.path.join(mount_path, "Users")
-            if os.path.isdir(users_dir):
-                print(f" Docker WSL mode found.")
-                try:
-                    for username in os.listdir(users_dir):
-                        user_path = os.path.join(users_dir, username)
-                        if not os.path.isdir(user_path):
-                            continue
-
-                        # AppData\Local\Docker\ — Docker Desktop WSL2 data disks (ext4.vhdx)
-                        docker_local = os.path.join(user_path, "AppData", "Local", "Docker")
-                        if os.path.isdir(docker_local):
-                            try:
-                                for subroot, _, subfiles in os.walk(docker_local, onerror=lambda e: None):
-                                    for fname in subfiles:
+                                    for fname in os.listdir(local_state):
                                         if fname.lower().endswith(".vhdx"):
-                                            vhdx = os.path.join(subroot, fname)
-                                            _write_row(type_="docker_desktop_wsl", artifact_path=vhdx)
+                                            vhdx = os.path.join(local_state, fname)
                                             vhdx_mount, nbd_dev, tmp_vhdx = _mount_vhdx(vhdx)
+                                            found_container = False
                                             if vhdx_mount:
                                                 try:
                                                     for row in _collect_docker_containers(vhdx_mount, computer_name):
-                                                        row["type"]          = "docker_desktop_container"
-                                                        row["artifact_path"] = vhdx
-                                                        writer.writerow(row)
-                                                        counter += 1
+                                                        _add_container(row, container_app=f"wsl:{pkg_name}")
+                                                        found_container = True
                                                 finally:
                                                     _umount_vhdx(vhdx_mount, nbd_dev, tmp_vhdx)
-                            except Exception:
-                                pass
+                                            if not found_container:
+                                                _add_artifact("wsl_distro_disk", vhdx)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-                        # AppData\Roaming\Docker\ — Docker Desktop settings / daemon config
-                        docker_roaming = os.path.join(user_path, "AppData", "Roaming", "Docker")
-                        if os.path.isdir(docker_roaming):
-                            try:
-                                for cfg_file in ("settings.json", "settings-store.json", "daemon.json"):
-                                    cfg_path = os.path.join(docker_roaming, cfg_file)
-                                    if os.path.isfile(cfg_path):
-                                        _write_row(type_="docker_desktop_config", artifact_path=cfg_path)
-                            except Exception:
-                                pass
+        with open(output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(container_rows)
 
-                        # .docker\config.json — Docker CLI credentials / config
-                        docker_cli = os.path.join(user_path, ".docker", "config.json")
-                        if os.path.isfile(docker_cli):
-                            try:
-                                _write_row(type_="docker_cli_config", artifact_path=docker_cli)
-                            except Exception:
-                                pass
+        with open(artifacts_output_file, mode='w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=artifact_columns)
+            writer.writeheader()
+            writer.writerows(artifact_rows)
 
-                        # AppData\Local\Packages\<distro>\LocalState\*.vhdx — WSL distro disks
-                        packages_dir = os.path.join(user_path, "AppData", "Local", "Packages")
-                        if os.path.isdir(packages_dir):
-                            try:
-                                for pkg_name in os.listdir(packages_dir):
-                                    local_state = os.path.join(packages_dir, pkg_name, "LocalState")
-                                    if not os.path.isdir(local_state):
-                                        continue
-                                    try:
-                                        for fname in os.listdir(local_state):
-                                            if fname.lower().endswith(".vhdx"):
-                                                vhdx = os.path.join(local_state, fname)
-                                                _write_row(type_="wsl_distro", artifact_path=vhdx)
-                                                vhdx_mount, nbd_dev, tmp_vhdx = _mount_vhdx(vhdx)
-                                                if vhdx_mount:
-                                                    try:
-                                                        for row in _collect_docker_containers(vhdx_mount, computer_name):
-                                                            row["type"]          = "wsl_container"
-                                                            row["artifact_path"] = vhdx
-                                                            writer.writerow(row)
-                                                            counter += 1
-                                                    finally:
-                                                        _umount_vhdx(vhdx_mount, nbd_dev, tmp_vhdx)
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-        if counter >= 1:
-            print(green(f"[+] Docker Desktop / WSL data has been written into {output_file} ({counter} entries)"))
+        if container_rows:
+            print(green(f"[+] Docker container data has been written into {output_file} ({len(container_rows)} entries)"))
         else:
-            print(yellow(f"No Docker Desktop / WSL data found, {output_file} should be empty"))
+            print(yellow(f"No Docker container data found, {output_file} should be empty"))
+
+        if artifact_rows:
+            print(green(f"[+] Docker artifacts (configs / unmounted disks) written into {artifacts_output_file} ({len(artifact_rows)} entries)"))
 
     except Exception as e:
-        print(red(f"[-] Error writing Docker Desktop / WSL info: {e}"))
+        print(red(f"[-] Error writing Docker info: {e}"))
 
 
 def get_windows_machine_name(mount_path):
@@ -3542,25 +3989,34 @@ def get_windows_executed_programs(mount_path, computer_name):
                             line = line.strip()
 
                             # Format 1: ".exe" and "LastWrite" on the same line
-                            if ".exe" in line and "LastWrite" in line:
-                                parts = line.split("  ")
-                                filepath = parts[0].strip()
-                                executed_date = parts[1].replace("LastWrite: ", "").strip()
-                                writer.writerow({
-                                    'computer_name': computer_name,
-                                    'filepath': filepath,
-                                    'executed_date': executed_date
-                                })
-                                counter += 1
+                            # (path can itself contain a ':' -- the drive letter --
+                            # so this line is fully self-contained and must NOT also
+                            # be fed to the generic Path:/LastWrite: fallback below,
+                            # otherwise its naive "first colon" split latches onto the
+                            # drive letter's ':' instead of the "LastWrite:" label and
+                            # shifts the whole path into the executed_date column).
+                            if ".exe" in line and "LastWrite" in line and "  " in line:
+                                parts = line.split("  ", 1)
+                                candidate_path = parts[0].strip()
+                                candidate_date = parts[1].replace("LastWrite:", "").strip()
+                                if candidate_path and candidate_date:
+                                    writer.writerow({
+                                        'computer_name': computer_name,
+                                        'filepath': candidate_path,
+                                        'executed_date': candidate_date
+                                    })
+                                    counter += 1
+                                continue
 
-                            # Format 2: Detected by "File Reference" line
-                            elif line.startswith("File Reference:"):
+                            # Format 2: Detected by "File Reference" line (multi-line entry)
+                            if line.startswith("File Reference:"):
                                 filepath = ""
                                 executed_date = ""
+                                continue
 
-                            if "LastWrite" in line:
+                            if line.startswith("LastWrite"):
                                 executed_date = line.split(":", 1)[1].strip()
-                            elif "Path" in line:
+                            elif line.startswith("Path"):
                                 filepath = line.split(":", 1)[1].strip()
 
                             # Write entry if both fields are populated
@@ -4280,6 +4736,393 @@ def get_windows_credentials(mount_path, computer_name):
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def get_windows_RCT(mount_path, computer_name):
+    """
+    Detect the main Remote Control Tools (RCT) on a Windows image: AnyDesk,
+    TeamViewer, ScreenConnect / ConnectWise Control, VNC (TightVNC/
+    UltraVNC/RealVNC), Chrome Remote Desktop and RustDesk.
+
+    For each tool found (machine-wide install under ProgramData/Program
+    Files, or per-user install under Users/<user>/AppData), records its
+    configuration file, its log file, and — best-effort, since formats
+    change across versions — the ID or email tied to the installation.
+    """
+    print(yellow("[!] Looking for Remote Control Tools (RCT) ..."))
+    output_file = os.path.join(script_path, result_folder, "windows_rct.csv")
+    csv_columns = ['computer_name', 'remote_app', 'configuration_file', 'log_file', 'identifiant']
+
+    users_dir = os.path.join(mount_path, 'Users')
+    users = []
+    if os.path.isdir(users_dir):
+        users = [u for u in os.listdir(users_dir) if os.path.isdir(os.path.join(users_dir, u))]
+
+    def _first_existing(entries):
+        """entries: list of {"scope": "machine"|"user", "rel": <relative glob pattern>}."""
+        for entry in entries:
+            if entry["scope"] == "user":
+                for user in users:
+                    pattern = os.path.join(mount_path, "Users", user, entry["rel"])
+                    matches = sorted(glob.glob(pattern))
+                    if matches:
+                        return matches[0]
+            else:
+                pattern = os.path.join(mount_path, entry["rel"])
+                matches = sorted(glob.glob(pattern))
+                if matches:
+                    return matches[0]
+        return ""
+
+    def _extract_id(path, regex):
+        if not path or not regex:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = re.search(regex, content)
+            return m.group(1).strip() if m else ""
+        except Exception:
+            return ""
+
+    rct_tools = [
+        {
+            "name": "AnyDesk",
+            "configs": [
+                {"scope": "machine", "rel": "ProgramData/AnyDesk/system.conf"},
+                {"scope": "user", "rel": "AppData/Roaming/AnyDesk/user.conf"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "ProgramData/AnyDesk/ad.trace"},
+                {"scope": "user", "rel": "AppData/Roaming/AnyDesk/ad.trace"},
+            ],
+            "id_regex": r'ad\.anynet\.id=(\d+)',
+        },
+        {
+            "name": "TeamViewer",
+            "configs": [
+                {"scope": "machine", "rel": "Program Files/TeamViewer/TeamViewer*.ini"},
+                {"scope": "machine", "rel": "Program Files (x86)/TeamViewer/TeamViewer*.ini"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "Program Files/TeamViewer/Logfiles/TeamViewer*_Logfile.log"},
+                {"scope": "machine", "rel": "Program Files (x86)/TeamViewer/Logfiles/TeamViewer*_Logfile.log"},
+            ],
+            "id_regex": r'ClientID=(\d+)',
+        },
+        {
+            "name": "ScreenConnect",
+            "configs": [
+                {"scope": "machine", "rel": "Program Files (x86)/ScreenConnect Client*/user.config"},
+                {"scope": "machine", "rel": "Program Files/ScreenConnect Client*/user.config"},
+                {"scope": "machine", "rel": "ProgramData/ScreenConnect Client*/user.config"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "Program Files (x86)/ScreenConnect Client*/ScreenConnect.ClientService.log"},
+                {"scope": "machine", "rel": "Program Files/ScreenConnect Client*/ScreenConnect.ClientService.log"},
+            ],
+            # the client install token embeds the operator's connection string,
+            # which usually carries an 'e=<email>' query param
+            "id_regex": r'[?&]e=([^&"\'<>\s]+)',
+        },
+        {
+            "name": "VNC",
+            "configs": [
+                {"scope": "machine", "rel": "Program Files/uvnc bvba/UltraVNC/ultravnc.ini"},
+                {"scope": "machine", "rel": "Program Files (x86)/uvnc bvba/UltraVNC/ultravnc.ini"},
+                {"scope": "machine", "rel": "Program Files/TightVNC/tvnserver.ini"},
+                {"scope": "machine", "rel": "Program Files (x86)/TightVNC/tvnserver.ini"},
+                {"scope": "machine", "rel": "Program Files/RealVNC/VNC Server/config.d/*"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "Program Files/uvnc bvba/UltraVNC/debug.log"},
+                {"scope": "machine", "rel": "ProgramData/RealVNC-Service/vncserver.log"},
+            ],
+            # VNC is password-based, no account/ID tied to the install
+            "id_regex": None,
+        },
+        {
+            "name": "Chrome Remote Desktop",
+            "configs": [
+                {"scope": "machine", "rel": "ProgramData/Google/Chrome Remote Desktop/host#*.json"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "ProgramData/Google/Chrome Remote Desktop/host*.log"},
+                {"scope": "user", "rel": "AppData/Local/Google/Chrome Remote Desktop/host*.log"},
+            ],
+            # host config JSON stores the linked Google account under xmpp_login
+            "id_regex": r'"xmpp_login"\s*:\s*"([^"]+)"',
+        },
+        {
+            "name": "RustDesk",
+            "configs": [
+                {"scope": "machine", "rel": "ProgramData/RustDesk/config/RustDesk2.toml"},
+                {"scope": "user", "rel": "AppData/Roaming/RustDesk/config/RustDesk2.toml"},
+            ],
+            "logs": [
+                {"scope": "machine", "rel": "ProgramData/RustDesk/log/*.log"},
+                {"scope": "user", "rel": "AppData/Roaming/RustDesk/log/*.log"},
+            ],
+            "id_regex": r'^\s*id\s*=\s*[\'"]?(\d+)[\'"]?',
+        },
+    ]
+
+    detections = []
+    try:
+        for tool in rct_tools:
+            config_found = _first_existing(tool["configs"])
+            log_found = _first_existing(tool["logs"])
+
+            if not config_found and not log_found:
+                continue
+
+            identifiant = _extract_id(config_found, tool["id_regex"]) or _extract_id(log_found, tool["id_regex"])
+
+            print(green(f"[+] {tool['name']} remote control tool detected"))
+            detections.append({
+                "computer_name": computer_name,
+                "remote_app": tool["name"],
+                "configuration_file": config_found,
+                "log_file": log_found,
+                "identifiant": identifiant,
+            })
+
+        with open(output_file, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(detections)
+
+    except Exception as e:
+        print(red(f"[-] Error retrieving remote control tools information: {e}"))
+
+    if detections:
+        print(green(f"[+] Remote Control Tools information has been written into {output_file}"))
+    else:
+        print(yellow("[!] No known Remote Control Tool detected"))
+
+
+def _read_anydesk_text(path):
+    """
+    Read an AnyDesk log/trace file and return its decoded text, auto-
+    detecting the encoding: connection_trace.txt is written UTF-16LE with
+    NO byte-order-mark, while ad.trace/ad_svc.trace/system.conf/user.conf
+    are plain UTF-8 — decoding the former as UTF-8 doesn't raise (0x00 is
+    valid UTF-8) but silently mangles every line (a NUL between each
+    letter), so it never matches anything downstream.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16-le", errors="ignore")
+    if raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16-be", errors="ignore")
+    # Heuristic: no BOM but every other byte is 0x00 in the first bytes
+    # (ASCII text stored as UTF-16LE) -> Windows default when no BOM is written.
+    sample = raw[:32]
+    if len(sample) >= 4 and sample[1::2].count(0) >= len(sample[1::2]) - 1:
+        return raw.decode("utf-16-le", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _parse_anydesk_ad_trace(trace_paths):
+    """
+    Correlate each incoming AnyDesk session with the remote IP address seen
+    just before it, by scanning ad.trace and/or ad_svc.trace. Lines look
+    like:
+
+        info 2022-08-24 00:11:24.676 lsvc 2324 2328 20 anynet.any_socket
+             — Logged in from 107.152.37.7:3460 on relay 30eb2fb5.
+        info 2022-08-24 00:11:25.627 back 2472 2496 app.backend_session
+             — Incoming session request: gh0st (462253849)
+
+    The "Logged in from ... on relay ..." line (subsystem anynet.any_socket,
+    "lsvc" module) carries the remote peer's source IP; the "Incoming
+    session request: <alias> (<id>)" line (app.backend_session, "back"
+    module) carries the AnyDesk ID/alias for that same session, ~1s later.
+
+    AnyDesk splits network-level logging (ad_svc.trace, the background
+    service) from session-level logging (ad.trace, per-user) depending on
+    how it's running, and which line type lands in which file isn't
+    consistently documented — so trace_paths accepts BOTH candidate files
+    for a given AnyDesk install and correlates events by their own embedded
+    timestamp (nearest preceding IP event within 10s), rather than assuming
+    both line types share one file in read order.
+
+    NOTE: this only covers *incoming* sessions. AnyDesk's trace format for
+    the outgoing/initiating side isn't publicly documented anywhere we
+    could confirm, so outgoing connections are not resolved here.
+
+    trace_paths: iterable of candidate file paths (missing ones are skipped).
+    Returns a dict keyed by (date, "HH:MM", remote_id) -> ip, matching the
+    coarser minute-level granularity of connection_trace.txt.
+    """
+    # The log-level column ("info"/"warning") is right-aligned/padded with
+    # leading spaces, e.g. "   info 2026-01-18 ..." vs "warning 2026-01-18
+    # ..." — so the line does NOT necessarily start with a non-whitespace
+    # char; anchor on optional leading whitespace instead of \S+ directly.
+    ip_re = re.compile(
+        r'^\s*\S+\s+(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+'
+        r'.*Logged in from\s+(?P<ip>[^:\s]+):\d+\s+on relay'
+    )
+    session_re = re.compile(
+        r'^\s*\S+\s+(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+'
+        r'.*Incoming session request:\s+(?P<alias>.+?)\s+\((?P<id>\d+)\)'
+    )
+    MAX_LAG_SECONDS = 10
+
+    ip_events = []       # [(datetime, ip)]
+    session_events = []  # [(datetime, date_str, "HH:MM", remote_id)]
+
+    for path in trace_paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            for line in _read_anydesk_text(path).splitlines():
+                m_ip = ip_re.search(line)
+                if m_ip:
+                    try:
+                        ts = datetime.strptime(f"{m_ip.group('date')} {m_ip.group('time')}", "%Y-%m-%d %H:%M:%S")
+                        ip_events.append((ts, m_ip.group("ip")))
+                    except ValueError:
+                        pass
+                    continue
+                m_sess = session_re.search(line)
+                if m_sess:
+                    try:
+                        ts = datetime.strptime(f"{m_sess.group('date')} {m_sess.group('time')}", "%Y-%m-%d %H:%M:%S")
+                        session_events.append((ts, m_sess.group("date"), m_sess.group("time")[:5], m_sess.group("id")))
+                    except ValueError:
+                        pass
+        except Exception as e:
+            print(red(f"[-] Error reading {path}: {e}"))
+
+    ip_lookup = {}
+    for sess_ts, date_str, hhmm_str, remote_id in session_events:
+        best_ip, best_delta = "", None
+        for ip_ts, ip in ip_events:
+            delta = (sess_ts - ip_ts).total_seconds()
+            if 0 <= delta <= MAX_LAG_SECONDS and (best_delta is None or delta < best_delta):
+                best_delta, best_ip = delta, ip
+        if best_ip:
+            ip_lookup.setdefault((date_str, hhmm_str, remote_id), best_ip)
+
+    return ip_lookup
+
+
+def get_windows_rct_connections(mount_path, computer_name):
+    """
+    Review AnyDesk's connection_trace.txt (machine-wide under ProgramData
+    and per-user under Users\\<user>\\AppData\\Roaming\\AnyDesk) to list
+    every recorded connection with its direction, enriched with the remote
+    IP address cross-referenced from ad.trace (same directory) when
+    available.
+
+    connection_trace.txt lines look like:
+        Incoming    2022-03-18, 02:50    User    732092099    732092099
+        Outgoing    2022-03-18, 03:12    User    845213960    845213960
+
+    connection_trace.txt itself records AnyDesk IDs/aliases, not IP
+    addresses. 'src'/'dst' are built from the local machine's own AnyDesk ID
+    (read from system.conf/user.conf next to the trace file, falling back
+    to computer_name if not found) and the remote AnyDesk ID/alias found on
+    the line, oriented according to Incoming/Outgoing. 'ip' is filled in for
+    incoming connections only, by matching (date, HH:MM, remote_id) against
+    sessions parsed out of ad.trace — see _parse_anydesk_ad_trace() for why
+    outgoing connections are left without an IP.
+    """
+    print(yellow("[!] Reviewing AnyDesk connection_trace.txt ..."))
+    output_file = os.path.join(script_path, result_folder, "windows_rct_connections.csv")
+    csv_columns = ['computer_name', 'src', 'dst', 'connection_date', 'ip']
+
+    def _local_anydesk_id(anydesk_dir):
+        for conf_name in ("system.conf", "user.conf"):
+            conf_path = os.path.join(anydesk_dir, conf_name)
+            if not os.path.isfile(conf_path):
+                continue
+            try:
+                content = _read_anydesk_text(conf_path)
+                m = re.search(r'ad\.anynet\.id=(\d+)', content)
+                if m:
+                    return m.group(1)
+            except Exception:
+                continue
+        return None
+
+    def _parse_trace_file(trace_path, local_identity, ip_lookup, rows):
+        try:
+            for line in _read_anydesk_text(trace_path).splitlines():
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+
+                direction = parts[0].strip().lower()
+                if direction not in ("incoming", "outgoing"):
+                    continue
+
+                date_str = parts[1].rstrip(',')
+                time_str = parts[2]
+                connection_date = f"{date_str} {time_str}"
+
+                remote_id = parts[4]
+                remote_alias = parts[5] if len(parts) >= 6 else remote_id
+                remote_identity = remote_id if remote_alias == remote_id else f"{remote_id} ({remote_alias})"
+
+                ip = ""
+                if direction == "incoming":
+                    src, dst = remote_identity, local_identity
+                    ip = ip_lookup.get((date_str, time_str, remote_id), "")
+                else:
+                    src, dst = local_identity, remote_identity
+
+                rows.append({
+                    "computer_name": computer_name,
+                    "src": src,
+                    "dst": dst,
+                    "connection_date": connection_date,
+                    "ip": ip,
+                })
+        except Exception as e:
+            print(red(f"[-] Error reading {trace_path}: {e}"))
+
+    rows = []
+    try:
+        # Machine-wide (AnyDesk running as a service)
+        machine_dir = os.path.join(mount_path, "ProgramData", "AnyDesk")
+        trace_path = os.path.join(machine_dir, "connection_trace.txt")
+        if os.path.isfile(trace_path):
+            local_identity = _local_anydesk_id(machine_dir) or computer_name
+            ip_lookup = _parse_anydesk_ad_trace([
+                os.path.join(machine_dir, "ad_svc.trace"),
+                os.path.join(machine_dir, "ad.trace"),
+            ])
+            _parse_trace_file(trace_path, local_identity, ip_lookup, rows)
+
+        # Per-user (AnyDesk running in user/portable mode)
+        users_dir = os.path.join(mount_path, "Users")
+        if os.path.isdir(users_dir):
+            for user in os.listdir(users_dir):
+                user_dir = os.path.join(users_dir, user, "AppData", "Roaming", "AnyDesk")
+                trace_path = os.path.join(user_dir, "connection_trace.txt")
+                if os.path.isfile(trace_path):
+                    local_identity = _local_anydesk_id(user_dir) or computer_name
+                    ip_lookup = _parse_anydesk_ad_trace([
+                        os.path.join(user_dir, "ad.trace"),
+                        os.path.join(user_dir, "ad_svc.trace"),
+                    ])
+                    _parse_trace_file(trace_path, local_identity, ip_lookup, rows)
+
+        with open(output_file, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    except Exception as e:
+        print(red(f"[-] Error retrieving AnyDesk connection trace: {e}"))
+
+    if rows:
+        print(green(f"[+] AnyDesk connections have been written into {output_file} ({len(rows)} entries)"))
+    else:
+        print(yellow(f"No AnyDesk connections found, {output_file} should be empty"))
 
 
 def get_windows_connections(mount_path, computer_name):
@@ -7095,6 +7938,8 @@ if len(sys.argv) > 1:
             get_windows_scheduled_tasks(mount_path, computer_name)
             get_windows_full_registry(mount_path, computer_name)
             get_windows_credentials(mount_path, computer_name)
+            get_windows_RCT(mount_path, computer_name)
+            get_windows_rct_connections(mount_path, computer_name)
             get_windows_browsing_history(mount_path, computer_name)
             get_windows_browsing_data(mount_path, computer_name)
             get_windows_browsing_hindsight(computer_name, mount_path)
@@ -7103,7 +7948,7 @@ if len(sys.argv) > 1:
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
-            get_windows_docker_wsl(mount_path, computer_name)
+            get_windows_docker(mount_path, computer_name)
             get_ia_apps(mount_path, computer_name)
         elif platform == "macOS":
             mac_root = os.path.join(mount_path, 'root')
@@ -7123,7 +7968,7 @@ if len(sys.argv) > 1:
             get_files_of_interest(mac_root, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mac_root)
             get_instant_messaging(computer_name, mac_root)
-            get_ia_apps(computer_name, mac_root)
+            get_ia_apps(mac_root, computer_name)
         else:
             print(yellow("[!] Unknown OS"))
             if automate:
