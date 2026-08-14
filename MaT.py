@@ -839,6 +839,40 @@ def list_installed_apps(mount_path, computer_name):
         else:
             print(red("[-] Unknown distribution"))
 
+def _extract_nginx_listen_port(content):
+    """
+    Extract the port from an nginx vhost's 'listen' directive, handling all
+    its forms: 'listen 80;', 'listen 443 ssl;', 'listen 127.0.0.1:8080;',
+    'listen [::]:80;', 'listen unix:/run/nginx.sock;'. A naive
+    the naive "listen" + digits regex grabs the first digit run in the directive,
+    which for 'listen 127.0.0.1:8080;' wrongly returns '127' (the IP's
+    first octet) instead of the actual port 8080.
+    """
+    m = re.search(r'^\s*listen\s+([^;]+);', content, re.MULTILINE)
+    if not m:
+        return '80'
+    listen_value = m.group(1).strip()
+    if not listen_value:
+        return '80'
+    addr_part = listen_value.split()[0]   # drop trailing flags like "ssl"/"default_server"
+
+    if addr_part.startswith('['):
+        # IPv6 bracket form: "[::1]:8080" or bare "[::1]" (falls back to default port)
+        ipv6_m = re.match(r'\[[0-9a-fA-F:]+\](?::(\d+))?', addr_part)
+        if ipv6_m and ipv6_m.group(1):
+            return ipv6_m.group(1)
+        return '80'
+    if addr_part.startswith('unix:'):
+        return 'unix_socket'
+    if ':' in addr_part:
+        # "IP:PORT" or "hostname:PORT"
+        port_candidate = addr_part.rsplit(':', 1)[-1]
+        return port_candidate if port_candidate.isdigit() else '80'
+    if addr_part.isdigit():
+        return addr_part
+    return '80'
+
+
 def get_nginx_info(computer_name, mount_path):
     print(green(f"[+] Nginx webserver detected"))
     print(yellow(f"[!]Retrieving Nginx information..."))
@@ -871,7 +905,6 @@ def get_nginx_info(computer_name, mount_path):
 
                             server_name_match = re.search(r'^\s*server_name\s+([^;]+);', content, re.MULTILINE)
                             root_match = re.search(r'^\s*root\s+([^;]+);', content, re.MULTILINE)
-                            listen_match = re.search(r'^\s*listen\s+(\d+)', content, re.MULTILINE)
 
                             if not (server_name_match or root_match):
                                 continue
@@ -880,7 +913,7 @@ def get_nginx_info(computer_name, mount_path):
                                 'computer_name': computer_name,
                                 'website_name': server_name_match.group(1).strip() if server_name_match else 'unknown',
                                 'website_root': root_match.group(1).strip() if root_match else 'unknown',
-                                'listening_port': listen_match.group(1).strip() if listen_match else '80',
+                                'listening_port': _extract_nginx_listen_port(content),
                                 'webserver': 'nginx',
                                 'source_file': real_path
                             })
@@ -903,7 +936,6 @@ def get_nginx_info(computer_name, mount_path):
 
                             server_name_match = re.search(r'^\s*server_name\s+([^;]+);', content, re.MULTILINE)
                             root_match = re.search(r'^\s*root\s+([^;]+);', content, re.MULTILINE)
-                            listen_match = re.search(r'^\s*listen\s+(\d+)', content, re.MULTILINE)
 
                             if not (server_name_match or root_match):
                                 continue
@@ -912,7 +944,7 @@ def get_nginx_info(computer_name, mount_path):
                                 'computer_name': computer_name,
                                 'website_name': server_name_match.group(1).strip() if server_name_match else 'unknown',
                                 'website_root': root_match.group(1).strip() if root_match else 'unknown',
-                                'listening_port': listen_match.group(1).strip() if listen_match else '80',
+                                'listening_port': _extract_nginx_listen_port(content),
                                 'webserver': 'nginx',
                                 'source_file': conf_path
                             })
@@ -924,6 +956,29 @@ def get_nginx_info(computer_name, mount_path):
         print(red(f"[-] Error retrieving Nginx information: {e}"))
 
     print(green(f"[+] Nginx information have been written into {output_file}"))
+
+def _extract_apache_listen_port(content):
+    """
+    Same bug/fix as _extract_nginx_listen_port() but for Apache's 'Listen'
+    directive: 'Listen 80', 'Listen 12.34.56.78:80', 'Listen [::]:80'.
+    Returns None (not '80') when no Listen directive is found, so the
+    caller can fall back to <VirtualHost *:port> instead.
+    """
+    m = re.search(r'^\s*Listen\s+(\S+)', content, re.MULTILINE)
+    if not m:
+        return None
+    addr_part = m.group(1).strip()
+
+    if addr_part.startswith('['):
+        ipv6_m = re.match(r'\[[0-9a-fA-F:]+\](?::(\d+))?', addr_part)
+        return ipv6_m.group(1) if (ipv6_m and ipv6_m.group(1)) else None
+    if ':' in addr_part:
+        port_candidate = addr_part.rsplit(':', 1)[-1]
+        return port_candidate if port_candidate.isdigit() else None
+    if addr_part.isdigit():
+        return addr_part
+    return None
+
 
 def get_apache_info(computer_name, mount_path):
     print(green(f"[+] Apache webserver detected"))
@@ -979,12 +1034,12 @@ def get_apache_info(computer_name, mount_path):
                                 website_root = root_match.group(1).strip() if root_match else 'unknown'
 
                                 # Port (Listen directive or <VirtualHost *:port>)
-                                listen_match = re.search(r'^\s*Listen\s+(\d+)', content, re.MULTILINE)
-                                if not listen_match:
+                                apache_port = _extract_apache_listen_port(content)
+                                if apache_port is None:
                                     vh_match = re.search(r'<VirtualHost\s+\*:(\d+)>', content)
                                     listening_port = vh_match.group(1) if vh_match else '80'
                                 else:
-                                    listening_port = listen_match.group(1)
+                                    listening_port = apache_port
 
                                 writer.writerow({
                                     'computer_name': computer_name,
@@ -2468,6 +2523,54 @@ def _get_claude_account_email(home_dir):
         return ""
 
 
+def _get_aider_account(aider_dir):
+    """
+    Best-effort identification of the LLM provider account/API key tied to
+    an Aider working directory. Aider has no "login" concept — it's driven
+    entirely by API keys, so the closest equivalent to an "account" is the
+    <provider>=<key> pair(s) it was configured with (openrouter, anthropic,
+    openai, ...). Sources, in the same directory as the .aider.* files:
+      - the CLI invocation banner recorded at the top of
+        .aider.chat.history.md: "> ... --api-key <provider>=<key> ...";
+      - .aider.conf.yml ("api-key: <provider>=<key>");
+      - .env ("<PROVIDER>_API_KEY=<key>").
+    Returns "<provider>=<key>[; <provider>=<key> ...]" or "" if none found.
+    """
+    found = {}  # provider -> key, first occurrence wins
+
+    chat_path = os.path.join(aider_dir, ".aider.chat.history.md")
+    if os.path.isfile(chat_path):
+        try:
+            with open(chat_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if not line.startswith(">"):
+                        continue
+                    for provider, key in re.findall(r'--api-key[= ]+([\w.-]+)=(\S+)', line):
+                        found.setdefault(provider, key)
+        except Exception:
+            pass
+
+    for cfg_name in (".aider.conf.yml", ".env"):
+        cfg_path = os.path.join(aider_dir, cfg_name)
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            # .aider.conf.yml: "api-key: openrouter=sk-or-v1-xxx" (possibly quoted)
+            for provider, key in re.findall(r'api-key:\s*["\']?([\w.-]+)=([^"\'\s]+)', content):
+                found.setdefault(provider, key)
+            # .env: "OPENROUTER_API_KEY=sk-or-v1-xxx", "ANTHROPIC_API_KEY=sk-ant-...", ...
+            for var, key in re.findall(r'^([A-Z0-9_]+)_API_KEY=(\S+)$', content, re.MULTILINE):
+                found.setdefault(var.lower().replace("_", "-"), key.strip('"\''))
+        except Exception:
+            pass
+
+    if not found:
+        return ""
+    return "; ".join(f"{p}={k}" for p, k in found.items())
+
+
 def get_ia_apps(mount_path, computer_name):
     output_file = os.path.join(script_path, result_folder, "ia_apps.csv")
     csv_columns  = ['computer_name', 'ia_app', 'ia_account', 'file_path']
@@ -2532,9 +2635,11 @@ def get_ia_apps(mount_path, computer_name):
                 # ── Détection sur les fichiers ────────────────────────────
                 for f in files:
                     if f in _IA_FILE_NAMES:
-                        _write(_IA_FILE_NAMES[f], os.path.join(root, f))
+                        account = ""
                         if _IA_FILE_NAMES[f] == "Aider":
+                            account = _get_aider_account(root)
                             aider_dirs.add(root)
+                        _write(_IA_FILE_NAMES[f], os.path.join(root, f), account)
 
         if counter >= 1:
             print(green(f"[+] IA apps artifacts written into {output_file} ({counter} entries)"))
@@ -5528,7 +5633,7 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
     files_to_search = ['wallet.*', '*.wallet', "*.kdbx", '*.tox', 'docker-compose.yml', "Dockerfile"]
     file_types_to_search = ["*.txt", "*.exe", "*.exe_", "*.sql", "*.ibd", "*.mdb", "*.psql", "*.pgsql", "*.frm",
                             "*.tbl", "*.mdf", "*.ndf", "*.ldf", "*.bson", "*.json", "*.dat", "*.db", "*.sqlite",
-                            "*.dmp", "pagefile.sys", "*.sh", "*.ps1", "*.py", "*.pl", "*.asc", "*.pgp", "*.gpg"]
+                            "*.dmp", "pagefile.sys", "*.sh", "*.ps1", "*.py", "*.pl", "*.asc", "*.pgp", "*.gpg", "*.conf", "*.cnf"]
 
     num_threads = threads_number
     files_found = []
@@ -5548,7 +5653,12 @@ def get_files_of_interest(mount_path, computer_name, threads_number, platform):
             except Exception as e:
                 print(f"Error in thread: {e}")
         # Ajouter les fichiers sans extension en parallèle
-        find_cmd_no_extension = f"find {mount_path} -type f ! -name '*.*'"
+        # "! -name '*.*'" wrongly treats a dotfile's leading dot as an
+        # extension (e.g. ".bash_history", ".netrc", ".git-credentials" all
+        # contain a '.' so they were silently excluded here) -- the regex
+        # below only counts a '.' that is NOT the first character of the
+        # basename, so genuinely extensionless hidden files are still caught.
+        find_cmd_no_extension = f"find {mount_path} -type f -regextype posix-extended ! -iregex '.*/[^/]+\\.[^/.]+$'"
         try:
             result_no_extension = subprocess.run(
                 find_cmd_no_extension,
@@ -5948,7 +6058,9 @@ def crypto_search(computer_name, mount_path, threads_number):
             print(f"Error executing find command: {e}")
     
     ## Collect files without extension
-    find_cmd_no_extension = f"find {mount_path} -type f ! -name '*.*'"
+    # (dotfile-aware: a leading '.' alone doesn't count as an extension,
+    # see the same fix in get_files_of_interest())
+    find_cmd_no_extension = f"find {mount_path} -type f -regextype posix-extended ! -iregex '.*/[^/]+\\.[^/.]+$'"
     try:
         result_no_extension = subprocess.run(find_cmd_no_extension, shell=True, capture_output=True, text=True, errors='replace')
         for path in result_no_extension.stdout.splitlines():
