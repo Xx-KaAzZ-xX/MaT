@@ -1,10 +1,10 @@
 rule Detect_Crypto_Elements {
     meta:
-        description = "Detects Bitcoin, Litecoin, Monero addresses excluding MD5 hashes"
+        description = "Detects Bitcoin, Litecoin, Monero, Ethereum, Solana, Dogecoin, USDT (ERC-20/TRC-20) addresses"
 
     strings:
-        $bitcoin_legacy = /\b1[a-km-zA-HJ-NP-Z1-9][a-km-zA-HJ-NP-Z0-9]{24,33}\b/
-        $bitcoin_p2sh = /\b3[a-km-zA-HJ-NP-Z1-9][a-km-zA-HJ-NP-Z0-9]{24,33}\b/
+        $bitcoin_legacy = /\b1[a-km-zA-HJ-NP-Z1-9][a-km-zA-HJ-NP-Z1-9]{24,33}\b/
+        $bitcoin_p2sh = /\b3[a-km-zA-HJ-NP-Z1-9][a-km-zA-HJ-NP-Z1-9]{24,33}\b/
         $bitcoin_bech32 = /\bbc1q[a-z0-9]{38,58}\b/
         $bitcoin_taproot = /\bbc1p[a-z0-9]{58}\b/
         // bitcoin_txid also works for ltc and monero TXID
@@ -26,6 +26,15 @@ rule Detect_Crypto_Elements {
         $ethereum_address = /\b0x[a-fA-F0-9]{40}\b/
         $ethereum_address_unicode = /\b0\x00x\x00([a-fA-F0-9]\x00){40}\b/
         $ethereum_txid = /\b0x[a-fA-F0-9]{64}\b/
+        // Solana addresses: Ed25519 public key, base58, 43-44 chars
+        $solana_address = /\b[1-9A-HJ-NP-Za-km-z]{43,44}\b/
+        $solana_txid = /\b[1-9A-HJ-NP-Za-km-z]{86,88}\b/
+        // Dogecoin: legacy addresses start with 'D', P2SH start with 'A'
+        $dogecoin_legacy = /\bD[a-km-zA-HJ-NP-Z1-9]{25,33}\b/
+        $dogecoin_multisig = /\bA[a-km-zA-HJ-NP-Z1-9]{33}\b/
+        // USDT TRC-20 (Tron): addresses start with 'T', 34 chars total
+        // USDT ERC-20 (Ethereum) and BEP-20 (BSC) are covered by $ethereum_address
+        $tron_address = /\bT[a-km-zA-HJ-NP-Z1-9]{33}\b/
 
     condition:
          filesize < 20000MB and
@@ -33,6 +42,7 @@ rule Detect_Crypto_Elements {
             $bitcoin_legacy or $bitcoin_p2sh or $bitcoin_bech32 or $bitcoin_taproot or $bitcoin_txid or $monero or $litecoin_legacy or $litecoin_bech32 or
             $privateKeyBIP38 or $privateKeyEscapeBIP38 or $privateKeyWIFuncompressed or $privateKeyEscapeWIFuncompressed or
             $privateKeyWIFcompressed or $privateKeyEscapeWIFcompressed or $privateWalletNodeBIP32 or $privateEscapeWalletNodeBIP32 or
-            $publicWalletNodeBIP32 or $publicEscapeWalletNodeBIP32 or $ethereum_address or $ethereum_address_unicode
+            $publicWalletNodeBIP32 or $publicEscapeWalletNodeBIP32 or $ethereum_address or $ethereum_address_unicode or $ethereum_txid or
+            $solana_address or $solana_txid or $dogecoin_legacy or $dogecoin_multisig or $tron_address
          )
 }
