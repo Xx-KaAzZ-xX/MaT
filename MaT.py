@@ -486,21 +486,38 @@ def _enrich_single_ip(ip, date_str):
     """Return asn, country, ip_type, tor_exit for one external IP."""
     result = {"asn": "", "country": "", "ip_type": "unknown", "tor_exit": False}
     try:
-        data     = requests.get(f"https://api.ipapi.is?q={ip}", timeout=10).json()
-        asn_info = data.get("asn", {})
-        loc      = data.get("location", {})
-        # ipapi.is without an API key returns a flat schema (no nested
-        # "asn"/"location"/"company" objects, just top-level "cc",
-        # "asn_num", "asn_org", "company_name") — fall back to those when
-        # the nested lookup comes up empty, so this keeps working whether
-        # a richer (paid-key) or the flat (free) response comes back.
-        asn_num  = asn_info.get("asn") or asn_info.get("asn_num") or data.get("asn_num")
-        asn_org  = (asn_info.get("org") or data.get("company", {}).get("name")
-                    or data.get("company_name") or data.get("asn_org") or "")
-        result["asn"]     = f"AS{asn_num} {asn_org}".strip() if asn_num else ""
-        result["country"] = loc.get("country_code", "")
-        if not result["country"]:
-            result["country"] = data.get("cc", "")
+        data = requests.get(f"https://api.ipapi.is?q={ip}", timeout=10).json()
+        loc = data.get("location", {})
+        if not isinstance(loc, dict):
+            loc = {}
+
+        # ipapi.is's unauthenticated free tier has been observed returning at
+        # least 3 different shapes for the SAME fields (varies per request,
+        # apparently by rate-limit tier), so "asn" and "company" must each be
+        # handled as dict OR string OR absent:
+        #   A) flat:   asn_num (int) / asn_org (str), company_name (str)
+        #   B) flat:   asn (str, already "AS<num> <org>"), company (str, org name)
+        #   paid) nested: asn: {"asn": <num>, "org": <str>, "type": <str>},
+        #                 company: {"name": <str>, "type": <str>}
+        asn_field = data.get("asn")
+        if isinstance(asn_field, dict):
+            asn_num = asn_field.get("asn") or asn_field.get("asn_num")
+            asn_org = asn_field.get("org") or ""
+            result["asn"] = f"AS{asn_num} {asn_org}".strip() if asn_num else ""
+        elif isinstance(asn_field, str) and asn_field.strip():
+            result["asn"] = asn_field.strip()
+        else:
+            asn_num = data.get("asn_num")
+            asn_org = data.get("asn_org") or data.get("company_name") or ""
+            result["asn"] = f"AS{asn_num} {asn_org}".strip() if asn_num else ""
+
+        # country_code (paid/location) > cc (flat schema A) > full country
+        # name (flat schema B, no code at all in that shape)
+        result["country"] = loc.get("country_code", "") or data.get("cc", "") or data.get("country", "")
+
+        company_field = data.get("company")
+        company_type = company_field.get("type", "").lower() if isinstance(company_field, dict) else ""
+        asn_type = asn_field.get("type", "").lower() if isinstance(asn_field, dict) else ""
 
         is_dc    = data.get("is_datacenter", False)
         is_tor   = data.get("is_tor",   False)
@@ -514,15 +531,12 @@ def _enrich_single_ip(ip, date_str):
             result["ip_type"] = "vpn"
         elif is_proxy:
             result["ip_type"] = "proxy"
+        elif company_type == "isp" or asn_type == "isp":
+            result["ip_type"] = "residential"
+        elif company_type in ("hosting", "cloud"):
+            result["ip_type"] = company_type
         else:
-            ct = data.get("company", {}).get("type", "").lower()
-            at = asn_info.get("type", "").lower()
-            if ct == "isp" or at == "isp":
-                result["ip_type"] = "residential"
-            elif ct in ("hosting", "cloud"):
-                result["ip_type"] = ct
-            else:
-                result["ip_type"] = "unknown"
+            result["ip_type"] = "unknown"
     except Exception:
         pass
 
@@ -710,7 +724,9 @@ def list_connections(mount_path, computer_name):
         enrich_thread = threading.Thread(
             target=_enrich_connections_background,
             args=(output_file,),
-            daemon=True,
+            daemon=False,   # non-daemon: the interpreter waits for it, a daemon
+                             # thread gets killed mid-flight (before df.to_csv())
+                             # as soon as the rest of the script finishes.
             name="ip-enrichment",
         )
         enrich_thread.start()
@@ -2110,6 +2126,71 @@ def get_linux_admin_panel(mount_path, computer_name):
         print(green(f"[+] Admin panel information has been written into {output_file}"))
     else:
         print(yellow("[!] No known admin panel solution detected"))
+
+
+def get_linux_logs(mount_path, computer_name):
+    """
+    Dump the mounted image's systemd journal via `journalctl --root=<mount_path>`,
+    in journalctl's default plain-text output (-o short) — the classic
+    rsyslog-style line: "Mon DD HH:MM:SS <hostname> <program>[pid]: message".
+    This is exactly what `journalctl -D journal/<folder>` prints with no -o
+    flag, written to file as-is; journalctl already parses the binary
+    .journal files for us, so there's nothing left to reimplement here.
+
+    --root=<mount_path> makes journalctl treat the mounted image as the
+    filesystem root and discover /var/log/journal/<machine-id>/*.journal
+    under it by itself, instead of reading the analysis host's own journal.
+
+    For Logstash, this needs a `grok` filter (e.g. the built-in
+    %{SYSLOGLINE} pattern) rather than the `csv`/`json` filters used for
+    the rest of this pipeline, since it's plain rsyslog-format text.
+    """
+    print(yellow("[!] Dumping systemd journal (journalctl --root) ..."))
+    output_file = os.path.join(script_path, result_folder, "journalctl.log")
+
+    journal_dir = os.path.join(mount_path, "var", "log", "journal")
+    if not os.path.isdir(journal_dir):
+        print(yellow(f"[!] No persistent journal at {journal_dir}, skipping (journalctl.log left empty)"))
+        open(output_file, "w").close()
+        return
+
+    counter = 0
+    try:
+        # Force the C locale so timestamps/month names stay in the classic
+        # English rsyslog form regardless of the analysis machine's own
+        # locale — otherwise "Sep 18" can come out as "sept. 18" (or any
+        # other language), breaking a standard %{SYSLOGTIMESTAMP} grok.
+        env = dict(os.environ, LC_ALL="C", LC_TIME="C")
+        proc = subprocess.Popen(
+            ["journalctl", f"--root={mount_path}", "--no-pager", "--all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            env=env,
+        )
+        with open(output_file, "w", encoding="utf-8") as f:
+            for line in proc.stdout:
+                f.write(line)
+                if line.strip():
+                    counter += 1
+
+        stderr_output = proc.stderr.read()
+        proc.wait()
+        if proc.returncode != 0 and counter == 0:
+            print(red(f"[-] journalctl failed: {stderr_output.strip()}"))
+
+    except FileNotFoundError:
+        print(red("[-] journalctl not found — install systemd/systemd-journal-remote"))
+        return
+    except Exception as e:
+        print(red(f"[-] Error dumping journal: {e}"))
+        return
+
+    if counter >= 1:
+        print(green(f"[+] {counter} journal entries written to {output_file}"))
+    else:
+        print(yellow(f"[!] No journal entries found, {output_file} should be empty"))
 
 
 def get_linux_crontab(mount_path, computer_name):
@@ -4723,7 +4804,7 @@ def hayabusa_evtx(mount_path, computer_name):
             output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.csv"
             #json_output_file = script_path + "/" + result_folder + "/" + "hayabusa_output.jsonl"
             print("[+] Launching Hayabusa...")
-            command = f"{hayabusa_path} csv-timeline -C -d {mount_path}/Windows/System32/winevt/Logs/ -T -o {output_file}"
+            command = f"{hayabusa_path} dfir-timeline -d {mount_path}/Windows/System32/winevt/Logs -o {output_file} -C -w -s -T"
             #command = f"{hayabusa_path} json-timeline -C -N -a -w -d {mount_path}/Windows/System32/winevt/Logs/ -L -o {json_output_file}"
             os.system(command)
             df = pd.read_csv(output_file)
@@ -5304,7 +5385,7 @@ def get_windows_connections(mount_path, computer_name):
     enrich_thread = threading.Thread(
         target=_enrich_connections_background,
         args=(output_file,),
-        daemon=True,
+        daemon=False,   # see comment on the "ip-enrichment" thread above
         name="ip-enrichment-win",
     )
     enrich_thread.start()
@@ -7166,7 +7247,7 @@ def get_mac_connections(mac_root, mac_private, computer_name):
         enrich_thread = threading.Thread(
             target=_enrich_connections_background,
             args=(output_file,),
-            daemon=True,
+            daemon=False,   # see comment on the "ip-enrichment" thread above
             name="ip-enrichment-mac",
         )
         enrich_thread.start()
@@ -7298,6 +7379,17 @@ def get_mft(computer_name, image_path, byte_offset):
         if os.path.exists(mft_csv_path):
             df = pd.read_csv(mft_csv_path)
             df['computer_name'] = computer_name
+            # analyzeMFT decodes filenames straight from the raw $FILE_NAME
+            # attribute bytes (UTF-16LE, errors='replace') with no control-
+            # character filtering. A corrupted/deleted MFT entry can decode
+            # to a "filename" containing a raw \r/\n -- still valid RFC4180
+            # CSV once quoted, but it breaks any line-oriented consumer.
+            # Escape the same way as the zsh/Claude Code/Aider histories.
+            for col in ('Filename', 'Filepath'):
+                if col in df.columns:
+                    df[col] = df[col].apply(
+                        lambda v: _escape_command_field(v) if isinstance(v, str) else v
+                    )
             df.to_csv(mft_csv_path, index=False)
             print(green(f"[+] MFT parsed to {mft_csv_path}"))
             #os.remove(mft_raw_path)
@@ -8030,6 +8122,7 @@ if len(sys.argv) > 1:
             get_linux_browsing_data(mount_path, computer_name)
             get_linux_crontab(mount_path, computer_name)
             get_linux_admin_panel(mount_path, computer_name)
+            get_linux_logs(mount_path, computer_name)
             get_files_of_interest(mount_path, computer_name, threads_number, platform)
             find_potential_db_leaks(computer_name, mount_path)
             get_instant_messaging(computer_name, mount_path)
