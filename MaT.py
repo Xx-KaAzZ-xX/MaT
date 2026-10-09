@@ -2162,7 +2162,7 @@ def get_linux_logs(mount_path, computer_name):
         # other language), breaking a standard %{SYSLOGTIMESTAMP} grok.
         env = dict(os.environ, LC_ALL="C", LC_TIME="C")
         proc = subprocess.Popen(
-            ["journalctl", f"--root={mount_path}", "--no-pager", "--all"],
+            ["journalctl", f"--root={mount_path}", "--no-pager", "--output=short-iso", "--all"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -6017,23 +6017,147 @@ def validate_bech32_address(address):
         return False
 
 def validate_ethereum_address(eth_address):
-    # Retire le préfixe '0x'
-    eth_address = eth_address.lower().replace("0x", "")
+    """
+    EIP-55 checksum validation. An address written all-lowercase or
+    all-uppercase carries no checksum (valid by convention, nothing to
+    check); a mixed-case address must match the EIP-55 checksum exactly,
+    or it's not a real address (typo/fabricated).
+    """
+    try:
+        if not re.match(r'^0x[a-fA-F0-9]{40}$', eth_address):
+            return False
 
-    # Hash Keccak-256 de l'adresse en minuscules
-    keccak_hash = sha3.keccak_256()
-    keccak_hash.update(eth_address.encode('utf-8'))
-    hash_keccak = keccak_hash.hexdigest()
+        hex_part = eth_address[2:]
 
-    # Applique la règle de la checksum EIP-55
-    checksum_address = "0x"
-    for i, char in enumerate(eth_address):
-        if char.isdigit():
-            checksum_address += char
-        else:
-            checksum_address += char.upper() if int(hash_keccak[i], 16) >= 8 else char.lower()
-    
-    return checksum_address    
+        # No casing was applied at all -> no checksum to verify, valid by convention
+        if hex_part == hex_part.lower() or hex_part == hex_part.upper():
+            return True
+
+        # Hash Keccak-256 de l'adresse en minuscules
+        keccak_hash = sha3.keccak_256()
+        keccak_hash.update(hex_part.lower().encode('utf-8'))
+        hash_keccak = keccak_hash.hexdigest()
+
+        # Applique la règle de la checksum EIP-55
+        checksum_address = "0x"
+        for i, char in enumerate(hex_part.lower()):
+            if char.isdigit():
+                checksum_address += char
+            else:
+                checksum_address += char.upper() if int(hash_keccak[i], 16) >= 8 else char.lower()
+
+        return checksum_address == eth_address
+    except Exception:
+        return False
+
+def validate_dogecoin_legacy(address):
+    """Dogecoin P2PKH ('D...'): Base58Check, version byte 0x1E, same structure as BTC/LTC."""
+    try:
+        if not re.match(r'^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$', address):
+            return False
+        decoded = base58.b58decode(address)
+        if len(decoded) != 25:
+            return False
+        if decoded[0] != 0x1E:
+            return False
+        data = decoded[:-4]
+        given_checksum = decoded[-4:]
+        recalculated_checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+        return given_checksum == recalculated_checksum
+    except Exception:
+        return False
+
+def validate_dogecoin_multisig(address):
+    """Dogecoin P2SH ('A...'/'9...'): Base58Check, version byte 0x16, same structure as BTC/LTC."""
+    try:
+        if not re.match(r'^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$', address):
+            return False
+        decoded = base58.b58decode(address)
+        if len(decoded) != 25:
+            return False
+        if decoded[0] != 0x16:
+            return False
+        data = decoded[:-4]
+        given_checksum = decoded[-4:]
+        recalculated_checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+        return given_checksum == recalculated_checksum
+    except Exception:
+        return False
+
+# Ed25519 curve constants (RFC 8032) for structural Solana address/signature validation.
+_ED25519_P = 2**255 - 19
+_ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+_ED25519_L = 2**252 + 27742317777372353535851937790883648493  # base point order
+
+def _ed25519_modp_sqrt(a):
+    """Square root of a mod p (p % 8 == 5), or None if a is not a quadratic residue."""
+    if a % _ED25519_P == 0:
+        return 0
+    candidate = pow(a, (_ED25519_P + 3) // 8, _ED25519_P)
+    if (candidate * candidate) % _ED25519_P == a % _ED25519_P:
+        return candidate
+    sqrt_m1 = pow(2, (_ED25519_P - 1) // 4, _ED25519_P)
+    candidate2 = (candidate * sqrt_m1) % _ED25519_P
+    if (candidate2 * candidate2) % _ED25519_P == a % _ED25519_P:
+        return candidate2
+    return None
+
+def is_valid_ed25519_point(raw32: bytes) -> bool:
+    """
+    True if raw32 (32 bytes) decompresses to a real point on the Ed25519
+    curve (RFC 8032), i.e. is structurally a valid Ed25519 public key —
+    NOT every 43-44 char base58 string of the right length is: unlike BTC/
+    LTC (Base58Check with an explicit 4-byte checksum), a Solana address
+    has no embedded checksum, it's the raw encoded public key itself, so
+    the only way to check it cryptographically is to verify it's actually
+    a point on the curve rather than arbitrary bytes.
+    """
+    if len(raw32) != 32:
+        return False
+    y = int.from_bytes(raw32, "little")
+    sign = (y >> 255) & 1
+    y &= (1 << 255) - 1
+    if y >= _ED25519_P:
+        return False
+    y2 = (y * y) % _ED25519_P
+    numerator = (y2 - 1) % _ED25519_P
+    denominator = (_ED25519_D * y2 + 1) % _ED25519_P
+    if denominator == 0:
+        return False
+    x2 = (numerator * pow(denominator, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+    x = _ed25519_modp_sqrt(x2)
+    if x is None:
+        return False
+    if x == 0 and sign == 1:
+        return False
+    return True
+
+def validate_solana_address(address):
+    """Solana address = raw base58-encoded Ed25519 public key (32 bytes, no checksum)."""
+    try:
+        decoded = base58.b58decode(address)
+        return is_valid_ed25519_point(decoded)
+    except Exception:
+        return False
+
+def validate_solana_txid(signature):
+    """
+    Solana transaction signature = raw base58-encoded Ed25519 signature
+    (64 bytes: R || S). Checks R is a valid curve point and S is properly
+    reduced (0 <= S < L, the group order) — the same structural checks a
+    real Ed25519 verifier does before even looking at the signed message.
+    """
+    try:
+        decoded = base58.b58decode(signature)
+        if len(decoded) != 64:
+            return False
+        r, s = decoded[:32], decoded[32:]
+        if not is_valid_ed25519_point(r):
+            return False
+        s_int = int.from_bytes(s, "little")
+        return 0 <= s_int < _ED25519_L
+    except Exception:
+        return False
 
 def has_internet_connection():
     """
@@ -6172,7 +6296,13 @@ def crypto_search(computer_name, mount_path, threads_number):
                 print(red(f"Thread encoutered an error: {e}"))
 
     # Écrire les résultats dans le fichier CSV
-    internet_access = has_internet_connection()
+    # Outbound internet (mempool.space bitcoin_txid lookup) is opt-in via --online —
+    # avoids silently phoning out to a third party during an offline/air-gapped triage.
+    if online:
+        internet_access = has_internet_connection()
+    else:
+        internet_access = False
+        print(yellow("[!] --online not set: skipping internet-based bitcoin_txid verification"))
     print(internet_access)
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=csv_columns)
@@ -6205,6 +6335,18 @@ def crypto_search(computer_name, mount_path, threads_number):
                 if row['type'] == 'ethereum_address':
                     is_valid = validate_ethereum_address(row['match'])
                     df_unique.at[index, 'verified'] = 'true' if is_valid else 'false'
+                if row['type'] == 'dogecoin_legacy':
+                    is_valid = validate_dogecoin_legacy(row['match'])
+                    df_unique.at[index, 'verified'] = 'true' if is_valid else 'false'
+                if row['type'] == 'dogecoin_multisig':
+                    is_valid = validate_dogecoin_multisig(row['match'])
+                    df_unique.at[index, 'verified'] = 'true' if is_valid else 'false'
+                if row['type'] == 'solana_address':
+                    is_valid = validate_solana_address(row['match'])
+                    df_unique.at[index, 'verified'] = 'true' if is_valid else 'false'
+                if row['type'] == 'solana_txid':
+                    is_valid = validate_solana_txid(row['match'])
+                    df_unique.at[index, 'verified'] = 'true' if is_valid else 'false'
                 if row['type'] == 'bitcoin_txid' and internet_access is True:
                     txid = row['match']
                     is_valid = validate_btc_transaction(txid)
@@ -6212,6 +6354,18 @@ def crypto_search(computer_name, mount_path, threads_number):
 
             # Filtrer les lignes où 'verified' est 'false'
             df_unique = df_unique[df_unique['verified'] != 'false']
+
+            # Tor's cached consensus/descriptor files list metadata for the
+            # ~6-7k relays of the whole Tor network, not just this machine —
+            # some relay operators publish a real donation BTC/crypto address
+            # in their public ContactInfo field (a documented, common practice,
+            # see the ContactInfo-Information-Sharing-Specification's "btc"
+            # field). Those addresses are genuinely checksum-valid (not a
+            # validator false positive) but belong to random relay operators
+            # worldwide, not to this machine's owner — exclude them as noise.
+            tor_cache_files = r'cached-microdesc-consensus|cached-microdescs|cached-consensus|cached-descriptors|cached-certs'
+            df_unique = df_unique[~df_unique['source_file'].str.contains(tor_cache_files, na=False, regex=True)]
+
             print(green(f"{df_unique.shape[0]} unique rows written to {output_file}"))
             df_unique.to_csv(output_file, index=False)
         else:
@@ -7544,6 +7698,47 @@ def auto_select_partition(partitions, real_image):
     return best_i
 
 
+def index_results(platform, tag):
+    """
+    Launch logstash against the Logstash conf matching the detected
+    platform (linux_environment.conf / windows_environment.conf), with
+    CASE_TAG (and CASE_PATH, the case's result folder) set in the
+    environment so the conf's "${CASE_TAG:unknown}" / "${CASE_PATH}"
+    references pick them up — see linux_environment.conf / windows_environment.conf,
+    whose `file` input's `path` and `tags` are parameterized this way.
+    """
+    conf_by_platform = {
+        "Linux": "/etc/logstash/conf.d/linux_environment.conf",
+        "Windows": "/etc/logstash/conf.d/windows_environment.conf",
+    }
+    conf_path = conf_by_platform.get(platform)
+    if not conf_path:
+        print(yellow(f"[!] No Logstash conf defined for platform '{platform}', skipping indexing"))
+        return
+    if not os.path.isfile(conf_path):
+        print(red(f"[-] Logstash conf not found: {conf_path}, skipping indexing"))
+        return
+    if not tag:
+        print(yellow("[!] No tag provided, skipping indexing"))
+        return
+
+    logstash_bin = shutil.which("logstash") or "/usr/share/logstash/bin/logstash"
+    case_path = os.path.join(script_path, result_folder)
+    print(yellow(f"[!] Indexing case '{tag}' ({case_path}) via {conf_path} ..."))
+
+    env = dict(os.environ, CASE_TAG=tag, CASE_PATH=case_path)
+    try:
+        result = subprocess.run([logstash_bin, "-f", conf_path], env=env)
+        if result.returncode == 0:
+            print(green(f"[+] Indexing complete (tag={tag})"))
+        else:
+            print(red(f"[-] logstash exited with code {result.returncode}"))
+    except FileNotFoundError:
+        print(red(f"[-] logstash binary not found (tried: {logstash_bin})"))
+    except Exception as e:
+        print(red(f"[-] Error launching logstash: {e}"))
+
+
 def check_dmg_prerequisites():
     """
     Verify that the tools required to process .dmg images are present:
@@ -7855,6 +8050,15 @@ parser.add_argument("-d", "--mount", required=True, help="Mount directory")
 parser.add_argument("-t", "--threads", required=False, type=int, default=4, help="Number of threads")
 parser.add_argument("--automate", action="store_true",
                     help="Non-interactive mode: auto-select the OS partition and run full triage without prompts")
+parser.add_argument("--online", action="store_true",
+                    help="Allow outbound internet calls for crypto address verification "
+                         "(bitcoin_txid lookup against mempool.space). Off by default — "
+                         "without it, bitcoin_txid matches are left as 'unknown' instead of verified.")
+parser.add_argument("--tag", required=False, default="", metavar="TAG",
+                    help="Case tag for Logstash indexing (sets CASE_TAG/CASE_PATH for "
+                         "linux_environment.conf / windows_environment.conf). With --automate, "
+                         "indexing runs automatically if --tag is set (skipped otherwise). "
+                         "Without --automate, you're prompted interactively instead.")
 parser.add_argument("--image-directory", dest="image_directory", required=False, metavar="DIR",
                     help="Directory containing disk images. Triage all images found (.E01, .raw, .img, .qcow2, .001, .dmg).\n"
                          "-d becomes the base directory; mount points are created as <-d>/<image_stem>/.\n"
@@ -7865,6 +8069,8 @@ image_path = args.image
 mount_path = args.mount
 threads_number = args.threads
 automate = args.automate
+online = args.online
+tag = args.tag
 
 if args.image_directory:
     img_dir = Path(args.image_directory)
@@ -8075,9 +8281,20 @@ if image_path:
             if not os.path.exists(mount_path):
                 os.makedirs(mount_path)
 
+            # norecovery isn't a valid option for every filesystem (e.g. exFAT
+            # rejects it outright: "fsconfig() failed: exfat: Unknown parameter
+            # 'norecovery'") — try it first (needed for ext4/XFS/NTFS journal
+            # replay avoidance), then fall back without it.
             try:
                 subprocess.run(["mount", "-o", f"ro,norecovery,offset={byte_offset}", real_image, mount_path], check=True)
                 print(green(f"[+] Mounted partition {part_num} at {mount_path} (offset {byte_offset})"))
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.run(["mount", "-o", f"ro,offset={byte_offset}", real_image, mount_path], check=True)
+                    print(green(f"[+] Mounted partition {part_num} at {mount_path} (offset {byte_offset}, ro only)"))
+                except Exception as e:
+                    print(red(f"[-] Failed to mount: {e}"))
+                    sys.exit(1)
             except Exception as e:
                 print(red(f"[-] Failed to mount: {e}"))
                 sys.exit(1)
@@ -8193,7 +8410,18 @@ if len(sys.argv) > 1:
                 print("Script is going to exit.")
                 sys.exit(0)
 
-
+        # Indexing (Logstash) — see index_results(): only Linux/Windows have a conf.
+        if automate:
+            if tag:
+                index_results(platform, tag)
+            else:
+                print(yellow("[!] --automate set but no --tag provided, skipping indexing"))
+        else:
+            do_index = input("Do you want to index this case into Logstash? (y/n): ").strip().lower()
+            if do_index in ("y", "yes"):
+                default_tag = tag or os.path.basename(os.path.normpath(result_folder))
+                entered_tag = input(f"Enter the tag to use for indexing [{default_tag}]: ").strip()
+                index_results(platform, entered_tag or default_tag)
 
 
     else:
